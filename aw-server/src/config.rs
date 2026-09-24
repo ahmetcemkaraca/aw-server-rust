@@ -23,6 +23,8 @@ pub fn is_testing() -> bool {
 /// Authentication configuration, serialised as `[auth]` in config.toml.
 #[derive(Serialize, Deserialize, Default)]
 pub struct AWAuthConfig {
+    #[serde(skip)]
+    pub sessions: Option<crate::sessions::Sessions>,
     /// Optional API key for Bearer-token authentication.
     /// When set, all `/api/*` endpoints except `/api/0/info` require:
     ///   Authorization: Bearer <api_key>
@@ -83,13 +85,15 @@ impl AWConfig {
         };
 
         // Needed for bucket imports
+        let maximum = if self.auth.sessions.is_some() { 16u64 } else { 1000u64 };
         let limits = Limits::default()
-            .limit("json", 1000u64.megabytes())
-            .limit("data-form", 1000u64.megabytes());
+            .limit("json", maximum.megabytes())
+            .limit("data-form", maximum.megabytes());
 
         config.address = self.address.parse().unwrap();
         config.port = self.port;
         config.limits = limits;
+        if self.auth.sessions.is_some() { config.log_level = LogLevel::Critical; }
 
         config
     }

@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "modes": ["off", "peak_ai", "custom_endpoint"],
+  "protocols": ["openai_chat_completions_v1"],
+  "valid_profile": {
+    "profile_id": "profile_01",
+    "display_name": "Synthetic endpoint",
+    "origin": "https://ai.example.invalid",
+    "endpoint_path": "/v1/chat/completions",
+    "protocol": "openai_chat_completions_v1",
+    "authentication": "bearer",
+    "model_id": "synthetic-model-v1",
+    "destination_type": "remote",
+    "region_note": "Not verified",
+    "retention_note": "Not verified",
+    "training_note": "Not verified",
+    "cost_note": null,
+    "credential_ref": "credential_01",
+    "resolved_addresses": ["8.8.8.8"]
+  },
+  "valid_request": {
+    "schema_version": 1,
+    "profile_id": "profile_01",
+    "feature": "report_explanation",
+    "question": "Explain this aggregate",
+    "aggregate": {
+      "method_id": "local-work-report",
+      "method_version": 1,
+      "break_time_seconds": 300,
+      "date_range": {"start_date": "2026-09-01", "end_date": "2026-09-07"},
+      "daily": [{"date": "2026-09-01", "duration_seconds": 3600.5, "session_count": 2, "average_session_seconds": 1800.25}],
+      "coverage": {"requested_periods": 7, "periods_with_data": 1, "limitation": "Incomplete capture can resemble an empty day."},
+      "weekly": [],
+      "monthly": [],
+      "comparison": null
+    }
+  },
+  "valid_category_request": {
+    "schema_version": 1,
+    "profile_id": "profile_01",
+    "feature": "category_suggestion",
+    "question": "Suggest possible project matches",
+    "aggregate": {
+      "categories": ["Design"],
+      "projects": [{"project_alias": "project-01"}],
+      "existing_mappings": []
+    }
+  },
+  "valid_timesheet_request": {
+    "schema_version": 1,
+    "profile_id": "profile_01",
+    "feature": "freelancer_draft",
+    "question": "Draft neutral wording",
+    "aggregate": {"project_alias": "project-01", "date": "2026-09-01", "approved_duration_seconds": 3600}
+  },
+  "invalid_requests": [
+    {
+      "schema_version": 1,
+      "profile_id": "profile_01",
+      "feature": "report_explanation",
+      "question": "Explain this aggregate",
+      "aggregate": {"events": [{"timestamp": "synthetic"}]}
+    },
+    {
+      "schema_version": 1,
+      "profile_id": "profile_01",
+      "feature": "report_explanation",
+      "question": "Explain this aggregate",
+      "aggregate": {"category": {"api_key": "synthetic-secret"}}
+    }
+  ]
+}

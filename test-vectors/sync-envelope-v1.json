@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "test_only": true,
+  "synthetic_plaintext": "SYNTHETIC_PRIVATE_ACTIVITY_MARKER",
+  "relay_fields": ["ciphertext", "key_epoch", "nonce", "object_id", "schema_version", "vault_id"],
+  "valid": {
+    "schema_version": 1,
+    "object_id": "AAAAAAAAAAAAAAAAAAAAAA",
+    "vault_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+    "key_epoch": 1,
+    "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "invalid": [
+    {
+      "id": "unknown-schema-version",
+      "envelope": {"schema_version": 2, "object_id": "AAAAAAAAAAAAAAAAAAAAAA", "vault_id": "AQEBAQEBAQEBAQEBAQEBAQ", "key_epoch": 1, "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"}
+    },
+    {
+      "id": "malformed-object-id",
+      "envelope": {"schema_version": 1, "object_id": "short", "vault_id": "AQEBAQEBAQEBAQEBAQEBAQ", "key_epoch": 1, "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"}
+    },
+    {
+      "id": "short-nonce",
+      "envelope": {"schema_version": 1, "object_id": "AAAAAAAAAAAAAAAAAAAAAA", "vault_id": "AQEBAQEBAQEBAQEBAQEBAQ", "key_epoch": 1, "nonce": "AA", "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"}
+    },
+    {
+      "id": "empty-ciphertext",
+      "envelope": {"schema_version": 1, "object_id": "AAAAAAAAAAAAAAAAAAAAAA", "vault_id": "AQEBAQEBAQEBAQEBAQEBAQ", "key_epoch": 1, "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "ciphertext": ""}
+    }
+  ]
+}

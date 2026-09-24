@@ -37,7 +37,7 @@ pub struct BucketMetadata {
     pub end: Option<DateTime<Utc>>,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone)]
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug)]
 pub struct BucketsExport {
     pub buckets: HashMap<String, Bucket>,
 }

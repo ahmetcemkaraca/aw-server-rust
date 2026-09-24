@@ -10,12 +10,19 @@ use aw_models::Bucket;
 use aw_models::BucketsExport;
 use aw_models::Event;
 use aw_models::TryVec;
+use aw_datastore::EventCorrection;
 
 use rocket::http::Status;
 use rocket::State;
 
 use crate::endpoints::util::BucketsExportRocket;
 use crate::endpoints::{HttpErrorJson, ServerState};
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitEventRequest {
+    split_at: DateTime<Utc>,
+}
 
 #[get("/")]
 pub fn buckets_get(
@@ -49,8 +56,12 @@ pub fn bucket_new(
     bucket_id: &str,
     message: Json<Bucket>,
     state: &State<ServerState>,
+    ingest: crate::endpoints::apikey::IngestOnly,
 ) -> Result<(), HttpErrorJson> {
     let mut bucket = message.into_inner();
+    if ingest.0 && bucket.events.is_some() {
+        return Err(HttpErrorJson::new(Status::Forbidden, "Capture credentials cannot import bucket history".into()));
+    }
     if bucket.id != bucket_id {
         bucket.id = bucket_id.to_string();
     }
@@ -133,13 +144,73 @@ pub fn bucket_events_create(
     bucket_id: &str,
     events: Json<Vec<Event>>,
     state: &State<ServerState>,
+    ingest: crate::endpoints::apikey::IngestOnly,
 ) -> Result<Json<Vec<Event>>, HttpErrorJson> {
+    let events = events.into_inner();
+    if ingest.0 && events.iter().any(|event| event.id.is_some()) {
+        return Err(HttpErrorJson::new(Status::Forbidden, "Capture credentials cannot overwrite stored events".into()));
+    }
+    if events.iter().any(|event| event.id.is_some()) {
+        if events.len() != 1 || events[0].id.is_none() {
+            return Err(HttpErrorJson::new(Status::BadRequest, "Correct one existing event at a time".into()));
+        }
+        return Ok(Json(vec![state.datastore.correct_event(bucket_id, events.into_iter().next().unwrap())?]));
+    }
     let datastore = &state.datastore;
     let res = datastore.insert_events(bucket_id, &events);
     match res {
         Ok(events) => Ok(Json(events)),
         Err(err) => Err(err.into()),
     }
+}
+
+#[put("/<bucket_id>/events/<event_id>", data = "<event>", format = "application/json")]
+pub fn bucket_event_correct(
+    bucket_id: &str,
+    event_id: i64,
+    event: Json<Event>,
+    state: &State<ServerState>,
+    ingest: crate::endpoints::apikey::IngestOnly,
+) -> Result<Json<Event>, HttpErrorJson> {
+    if ingest.0 { return Err(HttpErrorJson::new(Status::Forbidden, "Capture credentials cannot edit stored events".into())); }
+    let event = event.into_inner();
+    if event.id != Some(event_id) {
+        return Err(HttpErrorJson::new(Status::BadRequest, "Event ID does not match the requested event".into()));
+    }
+    Ok(Json(state.datastore.correct_event(bucket_id, event)?))
+}
+
+#[post("/<bucket_id>/events/<event_id>/split", data = "<request>", format = "application/json")]
+pub fn bucket_event_split(
+    bucket_id: &str,
+    event_id: i64,
+    request: Json<SplitEventRequest>,
+    state: &State<ServerState>,
+    ingest: crate::endpoints::apikey::IngestOnly,
+) -> Result<Json<Vec<Event>>, HttpErrorJson> {
+    if ingest.0 { return Err(HttpErrorJson::new(Status::Forbidden, "Capture credentials cannot split stored events".into())); }
+    Ok(Json(state.datastore.split_event(bucket_id, event_id, request.split_at)?))
+}
+
+#[post("/<bucket_id>/events/<first_id>/merge/<second_id>")]
+pub fn bucket_events_merge(
+    bucket_id: &str,
+    first_id: i64,
+    second_id: i64,
+    state: &State<ServerState>,
+    ingest: crate::endpoints::apikey::IngestOnly,
+) -> Result<Json<Event>, HttpErrorJson> {
+    if ingest.0 { return Err(HttpErrorJson::new(Status::Forbidden, "Capture credentials cannot merge stored events".into())); }
+    Ok(Json(state.datastore.merge_events(bucket_id, first_id, second_id)?))
+}
+
+#[get("/<bucket_id>/events/<event_id>/corrections")]
+pub fn bucket_event_corrections(
+    bucket_id: &str,
+    event_id: i64,
+    state: &State<ServerState>,
+) -> Result<Json<Vec<EventCorrection>>, HttpErrorJson> {
+    Ok(Json(state.datastore.get_event_corrections(bucket_id, event_id)?))
 }
 
 #[post(
@@ -152,8 +223,17 @@ pub fn bucket_events_heartbeat(
     heartbeat_json: Json<Event>,
     pulsetime: f64,
     state: &State<ServerState>,
+    ingest: crate::endpoints::apikey::IngestOnly,
 ) -> Result<Json<Event>, HttpErrorJson> {
     let heartbeat = heartbeat_json.into_inner();
+    if heartbeat.id.is_some() {
+        let (status, message) = if ingest.0 {
+            (Status::Forbidden, "Capture credentials cannot overwrite stored events")
+        } else {
+            (Status::BadRequest, "Heartbeat cannot update a stored event; use the correction endpoint")
+        };
+        return Err(HttpErrorJson::new(status, message.into()));
+    }
     let datastore = &state.datastore;
     match datastore.heartbeat(bucket_id, heartbeat, pulsetime) {
         Ok(e) => Ok(Json(e)),
@@ -185,6 +265,21 @@ pub fn bucket_events_delete_by_id(
         Ok(_) => Ok(()),
         Err(err) => Err(err.into()),
     }
+}
+
+#[delete("/<bucket_id>/events?<start>&<end>")]
+pub fn bucket_events_delete_range(
+    bucket_id: &str,
+    start: Option<String>,
+    end: Option<String>,
+    state: &State<ServerState>,
+    ingest: crate::endpoints::apikey::IngestOnly,
+) -> Result<Json<u64>, HttpErrorJson> {
+    if ingest.0 { return Err(HttpErrorJson::new(Status::Forbidden, "Capture credentials cannot delete history".into())); }
+    let parse = |value: Option<String>| value.and_then(|value| DateTime::parse_from_rfc3339(&value).ok()).map(|value| value.with_timezone(&Utc));
+    let start = parse(start).ok_or_else(|| HttpErrorJson::new(Status::BadRequest, "Start time must be RFC3339".into()))?;
+    let end = parse(end).ok_or_else(|| HttpErrorJson::new(Status::BadRequest, "End time must be RFC3339".into()))?;
+    Ok(Json(state.datastore.delete_events_in_range(bucket_id, start, end)?))
 }
 
 #[get("/<bucket_id>/export")]

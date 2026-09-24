@@ -11,12 +11,13 @@ bundled = ["rusqlite/bundled"]
 # Use bundled SQLCipher for encrypted databases (mutually exclusive with 'bundled')
 # Build with: cargo build --no-default-features --features encryption
 # Requires OpenSSL. Use 'encryption-vendored' to vendor OpenSSL as well.
-encryption = ["rusqlite/bundled-sqlcipher", "dep:zeroize"]
+encryption = ["rusqlite/bundled-sqlcipher", "dep:aw-sync-e2ee"]
 # Like 'encryption' but also vendors OpenSSL (fully self-contained)
-encryption-vendored = ["rusqlite/bundled-sqlcipher-vendored-openssl", "dep:zeroize"]
+encryption-vendored = ["rusqlite/bundled-sqlcipher-vendored-openssl", "dep:aw-sync-e2ee"]
 legacy_import_tests = []
 
 [dependencies]
+base64 = "0.22"
 dirs = "6"
 serde = "1.0"
 serde_json = "1.0"
@@ -24,12 +25,30 @@ chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.30", features = ["chrono", "serde_json"] }
 mpsc_requests = "0.3"
 log = "0.4"
-zeroize = { version = "1", optional = true, features = ["alloc"] }
+zeroize = { version = "1", features = ["alloc"] }
+ring = "0.17"
+subtle = "2"
 
 aw-models = { path = "../aw-models" }
 aw-transform = { path = "../aw-transform" }
+aw-sync-e2ee = { path = "../aw-sync-e2ee", optional = true }
 regex = "1"
 
 [dev-dependencies]
 # Used by migration tests to construct databases with old schema versions
 rusqlite = { version = "0.30", features = ["chrono", "serde_json"] }
+
+[[test]]
+name = "sync_identity"
+path = "tests/sync_identity.rs"
+required-features = ["encryption"]
+
+[[test]]
+name = "sync_objects"
+path = "tests/sync_objects.rs"
+required-features = ["encryption"]
+
+[[test]]
+name = "sync_event_apply"
+path = "tests/sync_event_apply.rs"
+required-features = ["encryption"]

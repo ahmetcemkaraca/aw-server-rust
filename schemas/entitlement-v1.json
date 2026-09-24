@@ -1,0 +1,413 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "oneOf": [
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "device_limit": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "entitlement_id": {
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "feature_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "grace_until": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "issued_at": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "plan_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "account_id",
+        "device_limit",
+        "entitlement_id",
+        "expires_at",
+        "feature_ids",
+        "grace_until",
+        "issued_at",
+        "plan_id",
+        "schema_version"
+      ],
+      "title": "EntitlementClaimsV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "EntitlementClaimsV1": {
+          "additionalProperties": false,
+          "properties": {
+            "account_id": {
+              "type": "string"
+            },
+            "device_limit": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "entitlement_id": {
+              "type": "string"
+            },
+            "expires_at": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "feature_ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "grace_until": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "issued_at": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "plan_id": {
+              "type": "string"
+            },
+            "schema_version": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "account_id",
+            "device_limit",
+            "entitlement_id",
+            "expires_at",
+            "feature_ids",
+            "grace_until",
+            "issued_at",
+            "plan_id",
+            "schema_version"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "claims": {
+          "$ref": "#/definitions/EntitlementClaimsV1"
+        },
+        "key_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "claims",
+        "key_id"
+      ],
+      "title": "EntitlementSigningPayloadV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "EntitlementClaimsV1": {
+          "additionalProperties": false,
+          "properties": {
+            "account_id": {
+              "type": "string"
+            },
+            "device_limit": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "entitlement_id": {
+              "type": "string"
+            },
+            "expires_at": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "feature_ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "grace_until": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "issued_at": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "plan_id": {
+              "type": "string"
+            },
+            "schema_version": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "account_id",
+            "device_limit",
+            "entitlement_id",
+            "expires_at",
+            "feature_ids",
+            "grace_until",
+            "issued_at",
+            "plan_id",
+            "schema_version"
+          ],
+          "type": "object"
+        },
+        "EntitlementSigningPayloadV1": {
+          "additionalProperties": false,
+          "properties": {
+            "claims": {
+              "$ref": "#/definitions/EntitlementClaimsV1"
+            },
+            "key_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "claims",
+            "key_id"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "payload": {
+          "$ref": "#/definitions/EntitlementSigningPayloadV1"
+        },
+        "signature": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "payload",
+        "signature"
+      ],
+      "title": "SignedEntitlementV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "expires_at": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "issued_at": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "key_id": {
+          "type": "string"
+        },
+        "revoked_entitlement_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "signature": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expires_at",
+        "issued_at",
+        "key_id",
+        "revoked_entitlement_ids",
+        "schema_version",
+        "sequence",
+        "signature"
+      ],
+      "title": "EntitlementRevocationSnapshotV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "device_limit": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "feature_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "grace_period_seconds": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "purchase_model": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "feature_ids",
+        "id",
+        "label",
+        "purchase_model",
+        "status"
+      ],
+      "title": "CommercialPackageV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "CommercialPackageV1": {
+          "additionalProperties": false,
+          "properties": {
+            "device_limit": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "feature_ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "grace_period_seconds": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "purchase_model": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "feature_ids",
+            "id",
+            "label",
+            "purchase_model",
+            "status"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "always_available_feature_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "packages": {
+          "items": {
+            "$ref": "#/definitions/CommercialPackageV1"
+          },
+          "type": "array"
+        },
+        "prices_published": {
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "always_available_feature_ids",
+        "packages",
+        "prices_published",
+        "schema_version"
+      ],
+      "title": "PackageCatalogV1",
+      "type": "object"
+    }
+  ],
+  "title": "PeakActivity Commercial Entitlement Contract V1"
+}

@@ -6,7 +6,6 @@
 /// It manages a sync-folder by syncing the aw-server datastore with a copy/staging datastore in the folder (one for each host).
 /// The sync folder is then synced with remotes using Syncthing/Dropbox/whatever.
 extern crate chrono;
-extern crate reqwest;
 extern crate serde_json;
 
 use std::error::Error;

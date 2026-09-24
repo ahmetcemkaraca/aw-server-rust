@@ -1,0 +1,246 @@
+{
+  "schema_version": 1,
+  "test_only": true,
+  "policy": {
+    "schema_version": 1,
+    "version": 3,
+    "hard_deny_version": 1,
+    "destinations": [
+      {
+        "id": "sync-relay",
+        "status": "experimental",
+        "https_origin": "https://relay.example.test",
+        "allowed_purposes": ["sync"]
+      }
+    ],
+    "purposes": [
+      {
+        "id": "sync",
+        "destination_id": "sync-relay",
+        "endpoint_path": "/sync",
+        "retention_id": "test-session",
+        "retention_disclosure": "Synthetic test destination; no request is sent.",
+        "allowed_fields": ["/timestamp", "/app", "/url", "/document_path", "/tracking"]
+      }
+    ],
+    "organization_rules": [],
+    "user_rules": [
+      {
+        "pattern": {"kind": "field", "value": "/url"},
+        "action": "domain_only"
+      },
+      {
+        "pattern": {"kind": "field", "value": "/document_path"},
+        "action": "stable_alias"
+      },
+      {
+        "pattern": {"kind": "field", "value": "/tracking"},
+        "action": "drop_field"
+      }
+    ],
+    "safe_zone_patterns": [
+      {"kind": "application", "value": "Personal"}
+    ],
+    "after_hours": {
+      "weekdays": [1, 2, 3, 4, 5, 6, 7],
+      "start_minute": 1140,
+      "end_minute": 360
+    }
+  },
+  "context": {
+    "local_offset_seconds": 0,
+    "alias_secret_hex": "00112233445566778899aabbccddeeff",
+    "preview_id_prefix": "vector-preview"
+  },
+  "cases": [
+    {
+      "id": "purpose-field-allowlist",
+      "request": {
+        "schema_version": 1,
+        "destination_id": "sync-relay",
+        "purpose_id": "sync",
+        "retention_id": "test-session",
+        "payload": {
+          "timestamp": "2026-09-23T12:00:00Z",
+          "app": "Editor",
+          "title": "Synthetic private title"
+        }
+      },
+      "now_utc": "2026-09-23T12:00:00Z",
+      "expected": {
+        "outcome": "allow",
+        "sanitized_payload": {
+          "timestamp": "2026-09-23T12:00:00Z",
+          "app": "Editor"
+        },
+        "removed_fields": ["/title"],
+        "reason_codes": ["field_removed"]
+      }
+    },
+    {
+      "id": "nested-secret-hard-deny",
+      "request": {
+        "schema_version": 1,
+        "destination_id": "sync-relay",
+        "purpose_id": "sync",
+        "retention_id": "test-session",
+        "payload": {
+          "timestamp": "2026-09-23T12:00:00Z",
+          "app": "Editor",
+          "metadata": {"credentials": {"password": "SYNTHETIC_NOT_A_CREDENTIAL"}}
+        }
+      },
+      "now_utc": "2026-09-23T12:00:00Z",
+      "expected": {
+        "outcome": "deny",
+        "sanitized_payload": null,
+        "removed_fields": [],
+        "reason_codes": ["secret_detected"]
+      }
+    },
+    {
+      "id": "split-secret-hard-deny",
+      "request": {
+        "schema_version": 1,
+        "destination_id": "sync-relay",
+        "purpose_id": "sync",
+        "retention_id": "test-session",
+        "payload": {
+          "timestamp": "2026-09-23T12:00:00Z",
+          "app": "Editor",
+          "parts": ["sk_live", "_test_123456789"]
+        }
+      },
+      "now_utc": "2026-09-23T12:00:00Z",
+      "expected": {
+        "outcome": "deny",
+        "sanitized_payload": null,
+        "removed_fields": [],
+        "reason_codes": ["secret_detected"]
+      }
+    },
+    {
+      "id": "url-origin-only",
+      "request": {
+        "schema_version": 1,
+        "destination_id": "sync-relay",
+        "purpose_id": "sync",
+        "retention_id": "test-session",
+        "payload": {
+          "timestamp": "2026-09-23T12:00:00Z",
+          "app": "Browser",
+          "url": "https://example.test/project/private?q=dashboard#fragment"
+        }
+      },
+      "now_utc": "2026-09-23T12:00:00Z",
+      "expected": {
+        "outcome": "allow",
+        "sanitized_payload": {
+          "timestamp": "2026-09-23T12:00:00Z",
+          "app": "Browser",
+          "url": "https://example.test"
+        },
+        "removed_fields": [],
+        "reason_codes": ["url_reduced"]
+      }
+    },
+    {
+      "id": "personal-safe-zone-deny",
+      "request": {
+        "schema_version": 1,
+        "destination_id": "sync-relay",
+        "purpose_id": "sync",
+        "retention_id": "test-session",
+        "payload": {
+          "timestamp": "2026-09-23T12:00:00Z",
+          "app": "Personal Browser"
+        }
+      },
+      "now_utc": "2026-09-23T12:00:00Z",
+      "expected": {
+        "outcome": "deny",
+        "sanitized_payload": null,
+        "removed_fields": [],
+        "reason_codes": ["safe_zone"]
+      }
+    },
+    {
+      "id": "local-after-hours-deny",
+      "request": {
+        "schema_version": 1,
+        "destination_id": "sync-relay",
+        "purpose_id": "sync",
+        "retention_id": "test-session",
+        "payload": {
+          "timestamp": "2026-09-23T22:00:00Z",
+          "app": "Editor"
+        }
+      },
+      "now_utc": "2026-09-23T22:00:00Z",
+      "expected": {
+        "outcome": "deny",
+        "sanitized_payload": null,
+        "removed_fields": [],
+        "reason_codes": ["after_hours"]
+      }
+    },
+    {
+      "id": "field-rule-drops-boolean",
+      "request": {
+        "schema_version": 1,
+        "destination_id": "sync-relay",
+        "purpose_id": "sync",
+        "retention_id": "test-session",
+        "payload": {
+          "timestamp": "2026-09-23T12:00:00Z",
+          "app": "Editor",
+          "tracking": true
+        }
+      },
+      "now_utc": "2026-09-23T12:00:00Z",
+      "expected": {
+        "outcome": "allow",
+        "sanitized_payload": {
+          "timestamp": "2026-09-23T12:00:00Z",
+          "app": "Editor"
+        },
+        "removed_fields": ["/tracking"],
+        "reason_codes": ["field_removed"]
+      }
+    },
+    {
+      "id": "unsupported-request-version-deny",
+      "request": {
+        "schema_version": 2,
+        "destination_id": "sync-relay",
+        "purpose_id": "sync",
+        "retention_id": "test-session",
+        "payload": {"timestamp": "2026-09-23T12:00:00Z", "app": "Editor"}
+      },
+      "now_utc": "2026-09-23T12:00:00Z",
+      "expected": {
+        "outcome": "deny",
+        "sanitized_payload": null,
+        "removed_fields": [],
+        "reason_codes": ["invalid_payload"]
+      }
+    },
+    {
+      "id": "unknown-destination-deny",
+      "request": {
+        "schema_version": 1,
+        "destination_id": "unregistered",
+        "purpose_id": "sync",
+        "retention_id": "test-session",
+        "payload": {"timestamp": "2026-09-23T12:00:00Z", "app": "Editor"}
+      },
+      "now_utc": "2026-09-23T12:00:00Z",
+      "expected": {
+        "outcome": "deny",
+        "sanitized_payload": null,
+        "removed_fields": [],
+        "reason_codes": ["unknown_destination"]
+      }
+    }
+  ]
+}

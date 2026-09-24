@@ -1,0 +1,263 @@
+{
+  "version": 1,
+  "manifest": {
+    "revision": 1,
+    "parent_hash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "tombstone_acknowledgements": [],
+    "operations": [
+      {
+        "schema_version": 1,
+        "device_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+        "counter": 1,
+        "origin_device_id": "CQkJCQkJCQkJCQkJCQkJCQ",
+        "local_event_id": 42,
+        "sync_bucket_id": "ZmZmZmZmZmZmZmZmZmZmZg",
+        "bucket_descriptor": {
+          "bucket_type": "app",
+          "client": "PeakActivity",
+          "data": {}
+        },
+        "kind": "upsert",
+        "policy_version": null,
+        "fields": {
+          "app": "Editor"
+        }
+      }
+    ],
+    "head_hash": "sbkqignIfJuQFJ-y4EJe0h1cmSE8jClQvgW3FOducEU",
+    "key_epoch": 1,
+    "writer_device_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+    "vault_id": "FxcXFxcXFxcXFxcXFxcXFw",
+    "writer_signing_public_key": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
+    "signing_bytes_hex": "5065616b41637469766974792d53796e632d4d616e69666573742d5369676e2d763100000000011717171717171717171717171717171700000000000000010101010101010101010101010101010100000000000000010000000000000000000000000000000000000000000000000000000000000000b1b92a8a09c87c9b90149fb2e0425ed21d5c99213c8c2950be05b714e76e7045",
+    "signature": "uxlnOj8hBVnYlgLHGhmQ4Z9ZxxPc8bigiX-SeRHZ440M5bhVBeDkdjh27GwRPWZLzm8vMH1tiP-zSOiXQ3d6AA"
+  },
+  "manifest_decisions": {
+    "first_revision": "advanced",
+    "exact_replay": "duplicate",
+    "same_revision_different_hash": "fork",
+    "lower_revision": "rollback",
+    "wrong_parent": "invalid_ancestry",
+    "revision_gap": "revision_gap"
+  },
+  "cases": {
+    "clock_skew_duplicate_and_concurrent_fields": {
+      "operations": [
+        {
+          "schema_version": 1,
+          "device_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+          "counter": 1,
+          "origin_device_id": "CQkJCQkJCQkJCQkJCQkJCQ",
+          "local_event_id": 42,
+          "sync_bucket_id": "ZmZmZmZmZmZmZmZmZmZmZg",
+          "bucket_descriptor": {
+            "bucket_type": "app",
+            "client": "PeakActivity",
+            "data": {}
+          },
+          "kind": "upsert",
+          "policy_version": null,
+          "fields": {
+            "app": "Editor",
+            "title": "initial"
+          }
+        },
+        {
+          "schema_version": 1,
+          "device_id": "AgICAgICAgICAgICAgICAg",
+          "counter": 4,
+          "origin_device_id": "CQkJCQkJCQkJCQkJCQkJCQ",
+          "local_event_id": 42,
+          "sync_bucket_id": "ZmZmZmZmZmZmZmZmZmZmZg",
+          "bucket_descriptor": null,
+          "kind": "correction",
+          "policy_version": null,
+          "fields": {
+            "title": "newer"
+          }
+        },
+        {
+          "schema_version": 1,
+          "device_id": "AwMDAwMDAwMDAwMDAwMDAw",
+          "counter": 5,
+          "origin_device_id": "CQkJCQkJCQkJCQkJCQkJCQ",
+          "local_event_id": 42,
+          "sync_bucket_id": "ZmZmZmZmZmZmZmZmZmZmZg",
+          "bucket_descriptor": null,
+          "kind": "correction",
+          "policy_version": null,
+          "fields": {
+            "app": "clock-a",
+            "timestamp": "2099-01-01T00:00:00Z"
+          }
+        },
+        {
+          "schema_version": 1,
+          "device_id": "BAQEBAQEBAQEBAQEBAQEBA",
+          "counter": 5,
+          "origin_device_id": "CQkJCQkJCQkJCQkJCQkJCQ",
+          "local_event_id": 42,
+          "sync_bucket_id": "ZmZmZmZmZmZmZmZmZmZmZg",
+          "bucket_descriptor": null,
+          "kind": "correction",
+          "policy_version": null,
+          "fields": {
+            "app": "clock-b",
+            "timestamp": "1990-01-01T00:00:00Z"
+          }
+        },
+        {
+          "schema_version": 1,
+          "device_id": "BAQEBAQEBAQEBAQEBAQEBA",
+          "counter": 5,
+          "origin_device_id": "CQkJCQkJCQkJCQkJCQkJCQ",
+          "local_event_id": 42,
+          "sync_bucket_id": "ZmZmZmZmZmZmZmZmZmZmZg",
+          "bucket_descriptor": null,
+          "kind": "correction",
+          "policy_version": null,
+          "fields": {
+            "app": "clock-b",
+            "timestamp": "1990-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "expected": {
+        "operation_count": 4,
+        "deleted": false,
+        "fields": {
+          "app": "clock-b",
+          "title": "newer",
+          "timestamp": "1990-01-01T00:00:00Z"
+        },
+        "conflict_fields": [
+          "app",
+          "timestamp",
+          "title"
+        ]
+      }
+    },
+    "tombstone_equal_counter": {
+      "operations": [
+        {
+          "schema_version": 1,
+          "device_id": "AgICAgICAgICAgICAgICAg",
+          "counter": 5,
+          "origin_device_id": "CQkJCQkJCQkJCQkJCQkJCQ",
+          "local_event_id": 42,
+          "sync_bucket_id": "ZmZmZmZmZmZmZmZmZmZmZg",
+          "bucket_descriptor": null,
+          "kind": "correction",
+          "policy_version": null,
+          "fields": {
+            "app": "changed"
+          }
+        },
+        {
+          "schema_version": 1,
+          "device_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+          "counter": 5,
+          "origin_device_id": "CQkJCQkJCQkJCQkJCQkJCQ",
+          "local_event_id": 42,
+          "sync_bucket_id": "ZmZmZmZmZmZmZmZmZmZmZg",
+          "bucket_descriptor": null,
+          "kind": "tombstone",
+          "policy_version": null,
+          "fields": {}
+        }
+      ],
+      "expected": {
+        "operation_count": 2,
+        "deleted": true,
+        "fields": {},
+        "tombstone_wins": "app"
+      }
+    },
+    "same_device_sequential_edit": {
+      "operations": [
+        {
+          "schema_version": 1,
+          "device_id": "BQUFBQUFBQUFBQUFBQUFBQ",
+          "counter": 1,
+          "origin_device_id": "CQkJCQkJCQkJCQkJCQkJCQ",
+          "local_event_id": 42,
+          "sync_bucket_id": "ZmZmZmZmZmZmZmZmZmZmZg",
+          "bucket_descriptor": {
+            "bucket_type": "app",
+            "client": "PeakActivity",
+            "data": {}
+          },
+          "kind": "upsert",
+          "policy_version": null,
+          "fields": {
+            "app": "old"
+          }
+        },
+        {
+          "schema_version": 1,
+          "device_id": "BQUFBQUFBQUFBQUFBQUFBQ",
+          "counter": 2,
+          "origin_device_id": "CQkJCQkJCQkJCQkJCQkJCQ",
+          "local_event_id": 42,
+          "sync_bucket_id": "ZmZmZmZmZmZmZmZmZmZmZg",
+          "bucket_descriptor": null,
+          "kind": "correction",
+          "policy_version": null,
+          "fields": {
+            "app": "new"
+          }
+        }
+      ],
+      "expected": {
+        "operation_count": 2,
+        "deleted": false,
+        "fields": {
+          "app": "new"
+        },
+        "conflict_fields": []
+      }
+    },
+    "policy_change_requires_local_choice": {
+      "operations": [
+        {
+          "schema_version": 1,
+          "device_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+          "counter": 3,
+          "origin_device_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+          "local_event_id": null,
+          "sync_bucket_id": null,
+          "bucket_descriptor": null,
+          "kind": "policy_change",
+          "policy_version": 3,
+          "fields": {
+            "recording": true
+          }
+        },
+        {
+          "schema_version": 1,
+          "device_id": "AgICAgICAgICAgICAgICAg",
+          "counter": 3,
+          "origin_device_id": "AgICAgICAgICAgICAgICAg",
+          "local_event_id": null,
+          "sync_bucket_id": null,
+          "bucket_descriptor": null,
+          "kind": "policy_change",
+          "policy_version": 3,
+          "fields": {
+            "recording": false
+          }
+        }
+      ],
+      "expected": {
+        "operation_count": 2,
+        "policy_devices": [
+          "AQEBAQEBAQEBAQEBAQEBAQ",
+          "AgICAgICAgICAgICAgICAg"
+        ],
+        "policy_versions": [
+          3
+        ]
+      }
+    }
+  }
+}

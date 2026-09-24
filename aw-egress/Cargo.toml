@@ -1,0 +1,27 @@
+[package]
+name = "aw-egress"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["bundled"]
+bundled = ["aw-datastore/bundled"]
+encryption = ["aw-datastore/encryption", "dep:aw-sync-e2ee"]
+encryption-vendored = ["aw-datastore/encryption-vendored", "dep:aw-sync-e2ee"]
+
+[dependencies]
+base64 = "0.22"
+aw-models = { path = "../aw-models" }
+aw-datastore = { path = "../aw-datastore", default-features = false }
+aw-sync-e2ee = { path = "../aw-sync-e2ee", optional = true }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+ring = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+subtle = "2"
+url = "2"
+zeroize = "1"
+
+[dev-dependencies]

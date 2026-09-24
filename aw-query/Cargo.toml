@@ -6,6 +6,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["bundled"]
+bundled = ["aw-datastore/bundled"]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -13,7 +17,7 @@ chrono = { version = "0.4", features = ["serde"] }
 plex = "0.3.0"
 log = "0.4"
 fancy-regex = "0.17.0"
-aw-datastore = { path = "../aw-datastore" }
+aw-datastore = { path = "../aw-datastore", default-features = false }
 aw-models = { path = "../aw-models" }
 aw-transform = { path = "../aw-transform" }
 

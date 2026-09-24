@@ -471,7 +471,7 @@ mod datastore_tests {
     }
 
     #[test]
-    fn test_migration_v4_to_v5() {
+    fn test_migration_v4_to_latest() {
         let mut db_path = get_cache_dir().unwrap();
         db_path.push("datastore-unittest-migration-v4.db");
         let db_path_str = db_path.to_str().unwrap().to_string();
@@ -538,7 +538,7 @@ mod datastore_tests {
             let version: i32 = conn
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 5);
+            assert_eq!(version, 6);
             let old_indexes: i64 = conn
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name IN
@@ -557,6 +557,12 @@ mod datastore_tests {
                 )
                 .unwrap();
             assert_eq!(new_index, 1, "composite index should exist");
+            let corrections_table: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'event_corrections'",
+                [],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(corrections_table, 1);
         }
 
         std::fs::remove_file(&db_path)

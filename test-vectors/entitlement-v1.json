@@ -1,0 +1,25 @@
+{
+  "entitlement": {
+    "payload": {
+      "claims": {
+        "account_id": "MjIyMjIyMjIyMjIyMjIyMg",
+        "device_limit": 3,
+        "entitlement_id": "MTExMTExMTExMTExMTExMQ",
+        "expires_at": 1900000100,
+        "feature_ids": [
+          "e2ee-sync"
+        ],
+        "grace_until": 1900003600,
+        "issued_at": 1899999940,
+        "plan_id": "plus",
+        "schema_version": 1
+      },
+      "key_id": "test-entitlement-key-v1"
+    },
+    "signature": "uJCkyWThUkvv390t0gMjru9mxgkPM8izFLGtHRK9QkioKnPgwV8hHC08EMBeDDRheAoQS1xPYnirVtuy40fzBQ"
+  },
+  "now": 1900000000,
+  "public_key": "KeWDOpFaZCmk46eUhHXDOO9Dbrgr6JyS8FlwRAPbnVU",
+  "schema_version": 1,
+  "signing_bytes": "{\"key_id\":\"test-entitlement-key-v1\",\"claims\":{\"schema_version\":1,\"entitlement_id\":\"MTExMTExMTExMTExMTExMQ\",\"account_id\":\"MjIyMjIyMjIyMjIyMjIyMg\",\"plan_id\":\"plus\",\"feature_ids\":[\"e2ee-sync\"],\"issued_at\":1899999940,\"expires_at\":1900000100,\"grace_until\":1900003600,\"device_limit\":3}}"
+}

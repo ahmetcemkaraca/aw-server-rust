@@ -10,19 +10,24 @@ pub mod classes;
 pub mod queries;
 pub mod single_instance;
 
-use std::{collections::HashMap, error::Error};
+use std::{collections::{HashMap, HashSet}, error::Error};
 
 use chrono::{DateTime, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde_json::{json, Map};
 use single_instance::SingleInstance;
-use std::net::TcpStream;
+use std::net::{IpAddr, Ipv6Addr, TcpStream};
 use std::time::Duration;
+use std::sync::Mutex;
 
-pub use aw_models::{Bucket, BucketMetadata, Event};
+pub use aw_models::{Bucket, BucketMetadata, Event, CapturePolicy};
 
 pub struct AwClient {
     client: reqwest::Client,
+    api_key: Mutex<Option<String>>,
+    refresh_key: Option<String>,
+    capture_policy: Option<CapturePolicy>,
+    capture_continuous: Mutex<HashSet<String>>,
     #[allow(dead_code)]
     single_instance: SingleInstance,
     pub baseurl: reqwest::Url,
@@ -40,6 +45,11 @@ fn get_hostname() -> String {
     gethostname::gethostname().to_string_lossy().to_string()
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+}
+
 fn build_client(api_key: Option<String>) -> Result<reqwest::Client, Box<dyn Error>> {
     let mut headers = HeaderMap::new();
     if let Some(api_key) = api_key {
@@ -49,16 +59,48 @@ fn build_client(api_key: Option<String>) -> Result<reqwest::Client, Box<dyn Erro
     }
 
     Ok(reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .default_headers(headers)
         .build()?)
 }
 
 impl AwClient {
     async fn send_success(
-        request: reqwest::RequestBuilder,
+        &self,
+        mut request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        request.send().await?.error_for_status()
+        if let Some(key) = self.api_key.lock().unwrap().as_ref() {
+            let mut value = HeaderValue::from_str(&format!("Bearer {key}")).expect("validated API key");
+            value.set_sensitive(true);
+            request = request.header(AUTHORIZATION, value);
+        }
+        let retry = request.try_clone();
+        let mut response = request.send().await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let (Some(refresh), Some(retry)) = (&self.refresh_key, retry) {
+                let renewal = self.client.post(format!("{}api/0/session/refresh", self.baseurl))
+                    .json(&json!({"refresh_token": refresh})).send().await?;
+                if renewal.status().is_success() {
+                    let value: serde_json::Value = renewal.json().await?;
+                    if let Some(token) = value.get("access_token").and_then(|value| value.as_str()) {
+                        if token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                            *self.api_key.lock().unwrap() = Some(token.to_string());
+                            let mut header = HeaderValue::from_str(&format!("Bearer {token}")).expect("hex token");
+                            header.set_sensitive(true);
+                            response = retry.header(AUTHORIZATION, header).send().await?;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(value) = response.headers().get("X-PeakActivity-Token").and_then(|value| value.to_str().ok()) {
+            if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                *self.api_key.lock().unwrap() = Some(value.to_string());
+            }
+        }
+        response.error_for_status()
     }
 
     pub fn new(host: &str, port: u16, name: &str) -> Result<AwClient, Box<dyn Error>> {
@@ -71,15 +113,61 @@ impl AwClient {
         name: &str,
         api_key: Option<String>,
     ) -> Result<AwClient, Box<dyn Error>> {
-        let baseurl = reqwest::Url::parse(&format!("http://{}:{}", host, port))?;
+        if !is_loopback_host(host) {
+            return Err("The local API client only accepts loopback hosts".into());
+        }
+        let host_authority = if host.parse::<Ipv6Addr>().is_ok() {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        let baseurl = reqwest::Url::parse(&format!("http://{host_authority}:{port}"))?;
+        if baseurl.scheme() != "http"
+            || !baseurl.host_str().is_some_and(is_loopback_host)
+            || !baseurl.username().is_empty()
+            || baseurl.password().is_some()
+            || baseurl.path() != "/"
+            || baseurl.query().is_some()
+            || baseurl.fragment().is_some()
+        {
+            return Err("The local API client only accepts an exact loopback origin".into());
+        }
         let hostname = get_hostname();
-        let client = build_client(api_key)?;
+        let capture_policy = if std::env::var("PEAKACTIVITY_CAPTURE").as_deref() == Ok("1") {
+            let mut policy: CapturePolicy = serde_json::from_str(&std::env::var("PEAKACTIVITY_CAPTURE_POLICY")?)?;
+            policy.validate()?;
+            Some(policy)
+        } else { None };
+        let api_key = match std::env::var("PEAKACTIVITY_API_TOKEN") {
+            Ok(token) => {
+                if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err("Invalid local capture credential".into());
+                }
+                let expected = reqwest::Url::parse(&std::env::var("PEAKACTIVITY_API_ORIGIN")?)?;
+                if expected.origin() != baseurl.origin()
+                    || !expected.username().is_empty()
+                    || expected.password().is_some()
+                    || expected.path() != "/"
+                    || expected.query().is_some()
+                    || expected.fragment().is_some()
+                {
+                    return Err("Refusing to send a local capture credential to a different server".into());
+                }
+                Some(token)
+            }
+            Err(_) => api_key,
+        };
+        let client = build_client(api_key.clone())?;
         //TODO: change localhost string to 127.0.0.1 for feature parity
         let single_instance_name = format!("{}-at-{}-on-{}", name, host, port);
         let single_instance = single_instance::SingleInstance::new(single_instance_name.as_str())?;
 
         Ok(AwClient {
             client,
+            api_key: Mutex::new(api_key),
+            capture_policy,
+            capture_continuous: Mutex::new(HashSet::new()),
+            refresh_key: std::env::var("PEAKACTIVITY_API_TOKEN").ok().and_then(|_| std::env::var("PEAKACTIVITY_API_REFRESH").ok()),
             single_instance,
             baseurl,
             name: name.to_string(),
@@ -89,7 +177,7 @@ impl AwClient {
 
     pub async fn get_bucket(&self, bucketname: &str) -> Result<Bucket, reqwest::Error> {
         let url = format!("{}api/0/buckets/{}", self.baseurl, bucketname);
-        let bucket = Self::send_success(self.client.get(url))
+        let bucket = self.send_success(self.client.get(url))
             .await?
             .json()
             .await?;
@@ -98,12 +186,12 @@ impl AwClient {
 
     pub async fn get_buckets(&self) -> Result<HashMap<String, Bucket>, reqwest::Error> {
         let url = format!("{}api/0/buckets/", self.baseurl);
-        Self::send_success(self.client.get(url)).await?.json().await
+        self.send_success(self.client.get(url)).await?.json().await
     }
 
     pub async fn create_bucket(&self, bucket: &Bucket) -> Result<(), reqwest::Error> {
         let url = format!("{}api/0/buckets/{}", self.baseurl, bucket.id);
-        Self::send_success(self.client.post(url).json(bucket)).await?;
+        self.send_success(self.client.post(url).json(bucket)).await?;
         Ok(())
     }
 
@@ -129,7 +217,7 @@ impl AwClient {
 
     pub async fn delete_bucket(&self, bucketname: &str) -> Result<(), reqwest::Error> {
         let url = format!("{}api/0/buckets/{}", self.baseurl, bucketname);
-        Self::send_success(self.client.delete(url)).await?;
+        self.send_success(self.client.delete(url)).await?;
         Ok(())
     }
 
@@ -148,7 +236,7 @@ impl AwClient {
             .collect();
 
         // Result is a sequence, one element per timeperiod
-        Self::send_success(self.client.post(url).json(&json!({
+        self.send_success(self.client.post(url).json(&json!({
             "query": query.split('\n').collect::<Vec<&str>>(),
             "timeperiods": timeperiods_str,
         })))
@@ -182,7 +270,7 @@ impl AwClient {
             url.query_pairs_mut()
                 .append_pair("limit", s.to_string().as_str());
         };
-        Self::send_success(self.client.get(url)).await?.json().await
+        self.send_success(self.client.get(url)).await?.json().await
     }
 
     pub async fn insert_event(
@@ -192,7 +280,7 @@ impl AwClient {
     ) -> Result<(), reqwest::Error> {
         let url = format!("{}api/0/buckets/{}/events", self.baseurl, bucketname);
         let eventlist = vec![event.clone()];
-        Self::send_success(self.client.post(url).json(&eventlist)).await?;
+        self.send_success(self.client.post(url).json(&eventlist)).await?;
         Ok(())
     }
 
@@ -202,8 +290,19 @@ impl AwClient {
         events: Vec<Event>,
     ) -> Result<(), reqwest::Error> {
         let url = format!("{}api/0/buckets/{}/events", self.baseurl, bucketname);
-        Self::send_success(self.client.post(url).json(&events)).await?;
+        self.send_success(self.client.post(url).json(&events)).await?;
         Ok(())
+    }
+
+    pub fn filter_capture(&self, bucket: &str, event: Event) -> Option<Event> {
+        match &self.capture_policy {
+            Some(policy) => {
+                let filtered = policy.filter(bucket, event, true);
+                if filtered.is_none() { self.capture_continuous.lock().unwrap().remove(bucket); }
+                filtered
+            },
+            None => Some(event),
+        }
     }
 
     pub async fn heartbeat(
@@ -212,11 +311,18 @@ impl AwClient {
         event: &Event,
         pulsetime: f64,
     ) -> Result<(), reqwest::Error> {
+        let mut event = match self.filter_capture(bucketname, event.clone()) {
+            Some(event) => event,
+            None => return Ok(()),
+        };
+        if self.capture_policy.is_some() && !self.capture_continuous.lock().unwrap().insert(bucketname.to_string()) {
+            event.data.insert("capture_break".into(), serde_json::Value::Bool(true));
+        }
         let url = format!(
             "{}api/0/buckets/{}/heartbeat?pulsetime={}",
             self.baseurl, bucketname, pulsetime
         );
-        Self::send_success(self.client.post(url).json(&event)).await?;
+        self.send_success(self.client.post(url).json(&event)).await?;
         Ok(())
     }
 
@@ -229,13 +335,13 @@ impl AwClient {
             "{}api/0/buckets/{}/events/{}",
             self.baseurl, bucketname, event_id
         );
-        Self::send_success(self.client.delete(url)).await?;
+        self.send_success(self.client.delete(url)).await?;
         Ok(())
     }
 
     pub async fn get_event_count(&self, bucketname: &str) -> Result<i64, reqwest::Error> {
         let url = format!("{}api/0/buckets/{}/events/count", self.baseurl, bucketname);
-        let res = Self::send_success(self.client.get(url))
+        let res = self.send_success(self.client.get(url))
             .await?
             .text()
             .await?;
@@ -248,17 +354,22 @@ impl AwClient {
 
     pub async fn get_info(&self) -> Result<aw_models::Info, reqwest::Error> {
         let url = format!("{}api/0/info", self.baseurl);
-        Self::send_success(self.client.get(url)).await?.json().await
+        self.send_success(self.client.get(url)).await?.json().await
     }
 
     pub async fn get_setting(&self, setting: &str) -> Result<serde_json::Value, reqwest::Error> {
         let url = format!("{}api/0/settings/{}", self.baseurl, setting);
-        Self::send_success(self.client.get(url)).await?.json().await
+        self.send_success(self.client.get(url)).await?.json().await
     }
 
     pub async fn get_settings(&self) -> Result<aw_models::Settings, reqwest::Error> {
         let url = format!("{}api/0/settings", self.baseurl);
-        Self::send_success(self.client.get(url)).await?.json().await
+        self.send_success(self.client.get(url)).await?.json().await
+    }
+
+    pub async fn sync_run(&self) -> Result<serde_json::Value, reqwest::Error> {
+        let url = format!("{}api/0/sync/run", self.baseurl);
+        self.send_success(self.client.post(url).json(&json!({}))).await?.json().await
     }
 
     // TODO: make async
@@ -293,5 +404,21 @@ impl AwClient {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod network_boundary_tests {
+    use super::is_loopback_host;
+
+    #[test]
+    fn only_loopback_hosts_are_allowed_for_local_api_clients() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.8.4.2"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("203.0.113.12"));
+        assert!(!is_loopback_host("example.test"));
+        assert!(!is_loopback_host("127.0.0.1.example.test"));
     }
 }

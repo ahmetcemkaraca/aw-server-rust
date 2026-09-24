@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "method_id": "union-no-overlap",
+  "method_version": 1,
+  "cases": [
+    {
+      "id": "exact-duplicate-first-source-wins",
+      "first": [
+        {"id": null, "timestamp": "2026-06-01T09:00:00Z", "duration": 3600.0, "data": {"source": "laptop"}}
+      ],
+      "second": [
+        {"id": null, "timestamp": "2026-06-01T09:00:00Z", "duration": 3600, "data": {"source": "phone"}}
+      ],
+      "expected": [
+        {"id": null, "timestamp": "2026-06-01T09:00:00Z", "duration": 3600.0, "data": {"source": "laptop"}}
+      ]
+    },
+    {
+      "id": "partial-overlap-is-split-with-first-source-precedence",
+      "first": [
+        {"id": null, "timestamp": "2026-06-01T09:00:00Z", "duration": 3600, "data": {"source": "laptop"}}
+      ],
+      "second": [
+        {"id": null, "timestamp": "2026-06-01T09:30:00Z", "duration": 3600, "data": {"source": "phone"}}
+      ],
+      "expected": [
+        {"id": null, "timestamp": "2026-06-01T09:00:00Z", "duration": 3600.0, "data": {"source": "laptop"}},
+        {"id": null, "timestamp": "2026-06-01T10:00:00Z", "duration": 1800.0, "data": {"source": "phone"}}
+      ]
+    },
+    {
+      "id": "reversing-source-order-reverses-duplicate-precedence",
+      "first": [
+        {"id": null, "timestamp": "2026-06-01T09:00:00Z", "duration": 3600.0, "data": {"source": "phone"}}
+      ],
+      "second": [
+        {"id": null, "timestamp": "2026-06-01T09:00:00Z", "duration": 3600, "data": {"source": "laptop"}}
+      ],
+      "expected": [
+        {"id": null, "timestamp": "2026-06-01T09:00:00Z", "duration": 3600.0, "data": {"source": "phone"}}
+      ]
+    }
+  ]
+}

@@ -24,6 +24,12 @@ pub mod device_id;
 pub mod dirs;
 pub mod endpoints;
 pub mod logging;
+pub mod sessions;
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+pub mod sync_control;
+#[cfg(all(feature = "plugin-runtime", any(feature = "encryption", feature = "encryption-vendored")))]
+pub mod plugin_host;
+pub use aw_models::CapturePolicy;
 
 #[cfg(target_os = "android")]
 pub mod android;

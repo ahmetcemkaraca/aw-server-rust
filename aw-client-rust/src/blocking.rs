@@ -90,6 +90,7 @@ impl AwClient {
     proxy_method!(get_info, aw_models::Info,);
     proxy_method!(get_setting, serde_json::Value, setting: &str);
     proxy_method!(get_settings, aw_models::Settings,);
+    proxy_method!(sync_run, serde_json::Value,);
 
     pub fn wait_for_start(&self) -> Result<(), Box<dyn Error>> {
         self.client.wait_for_start()

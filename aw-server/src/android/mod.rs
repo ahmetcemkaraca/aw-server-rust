@@ -30,12 +30,16 @@ pub extern "C" fn rust_greeting(to: *const c_char) -> *mut c_char {
 pub mod android {
     extern crate jni;
 
-    use self::jni::objects::{JClass, JString};
-    use self::jni::sys::{jdouble, jint, jstring};
+    use self::jni::objects::{JByteArray, JClass, JString};
+    use self::jni::sys::{jboolean, jdouble, jint, jstring, JNI_FALSE, JNI_TRUE};
     use self::jni::JNIEnv;
     use super::*;
 
+    use std::fmt::Write;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+    use zeroize::Zeroizing;
+    use crate::sessions::{Scope, Sessions};
 
     use crate::endpoints;
     use crate::endpoints::ServerState;
@@ -48,21 +52,40 @@ pub mod android {
     use aw_datastore::Datastore;
     use aw_models::{Bucket, Event, TimeInterval};
 
-    static mut DATASTORE: Option<Datastore> = None;
+    static DATASTORE: Mutex<Option<Datastore>> = Mutex::new(None);
+    static VAULT_KEY: Mutex<Option<Zeroizing<[u8; 32]>>> = Mutex::new(None);
+    static LOCAL_SESSIONS: Mutex<Option<Sessions>> = Mutex::new(None);
+    static SYNC_CONTROL: crate::sync_control::SyncControl = crate::sync_control::SyncControl::new();
 
-    unsafe fn openDatastore() -> Datastore {
-        match DATASTORE {
-            Some(ref ds) => ds.clone(),
-            None => {
-                let db_dir = dirs::db_path(false)
-                    .expect("Failed to get db path")
-                    .to_str()
-                    .unwrap()
-                    .to_string();
-                DATASTORE = Some(Datastore::new(db_dir, false));
-                openDatastore()
-            }
+    fn local_sessions() -> Sessions {
+        let mut sessions = LOCAL_SESSIONS.lock().expect("local session store unavailable");
+        sessions.get_or_insert_with(|| Sessions::new(5600, false)).clone()
+    }
+
+    fn key_as_hex(key: &[u8; 32]) -> String {
+        let mut hex = String::with_capacity(64);
+        for byte in key {
+            write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
         }
+        hex
+    }
+
+    fn openDatastore() -> Result<Datastore, String> {
+        let mut stored_datastore = DATASTORE.lock().map_err(|_| "vault state unavailable".to_string())?;
+        if let Some(datastore) = stored_datastore.as_ref() {
+            return Ok(datastore.clone());
+        }
+        let stored_key = VAULT_KEY.lock().map_err(|_| "vault state unavailable".to_string())?;
+        let key = stored_key.as_ref().ok_or_else(|| "vault key unavailable".to_string())?;
+        let db_dir = dirs::db_path(false)
+            .map_err(|_| "vault path unavailable".to_string())?
+            .to_str()
+            .ok_or_else(|| "vault path is not valid UTF-8".to_string())?
+            .to_string();
+        let datastore = Datastore::open_encrypted(db_dir, key_as_hex(&**key))
+            .map_err(|_| "encrypted vault could not be opened".to_string())?;
+        *stored_datastore = Some(datastore.clone());
+        Ok(datastore)
     }
 
     #[no_mangle]
@@ -117,9 +140,16 @@ pub mod android {
         info!("Building server state...");
 
         // FIXME: Why is unsafe needed here? Can we get rid of it?
+        let datastore = match openDatastore() {
+            Ok(datastore) => datastore,
+            Err(_) => {
+                error!("Encrypted vault unavailable; server startup stopped");
+                return;
+            }
+        };
         unsafe {
             let server_state: ServerState = endpoints::ServerState {
-                datastore: openDatastore(),
+                datastore,
                 asset_resolver: endpoints::AssetResolver::new(None),
                 device_id: device_id::get_device_id(),
             };
@@ -127,6 +157,8 @@ pub mod android {
 
             let mut server_config = crate::config::create_config(false, None);
             server_config.port = 5600;
+            server_config.auth.api_key = None;
+            server_config.auth.sessions = Some(local_sessions());
 
             endpoints::build_rocket(server_state, server_config)
                 .launch()
@@ -175,16 +207,158 @@ pub mod android {
     }
 
     #[no_mangle]
-    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_getBuckets(
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_setVaultKey(
+        env: JNIEnv,
+        _: JClass,
+        java_key: JByteArray,
+    ) -> jboolean {
+        let mut bytes = match env.convert_byte_array(java_key) {
+            Ok(bytes) if bytes.len() == 32 => bytes,
+            Ok(mut bytes) => {
+                bytes.fill(0);
+                return JNI_FALSE;
+            }
+            Err(_) => return JNI_FALSE,
+        };
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        bytes.fill(0);
+        let datastore = match DATASTORE.lock() {
+            Ok(datastore) => datastore,
+            Err(_) => {
+                key.fill(0);
+                return JNI_FALSE;
+            }
+        };
+        let mut stored_key = match VAULT_KEY.lock() {
+            Ok(key) => key,
+            Err(_) => {
+                key.fill(0);
+                return JNI_FALSE;
+            }
+        };
+        match stored_key.as_ref() {
+            Some(existing) if &**existing == &key => {
+                key.fill(0);
+                JNI_TRUE
+            }
+            Some(_) => {
+                key.fill(0);
+                JNI_FALSE
+            }
+            None if datastore.is_none() => {
+                *stored_key = Some(Zeroizing::new(key));
+                JNI_TRUE
+            }
+            None => {
+                key.fill(0);
+                JNI_FALSE
+            }
+        }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_initializeVault(
+        _: JNIEnv,
+        _: JClass,
+    ) -> jboolean {
+        match openDatastore() {
+            Ok(_) => JNI_TRUE,
+            Err(_) => JNI_FALSE,
+        }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_nativeLocalCommand(
+        env: JNIEnv,
+        _: JClass,
+        java_command: JString,
+        java_arguments: JString,
+    ) -> jstring {
+        let command = jstring_to_string(&env, java_command);
+        let arguments = jstring_to_string(&env, java_arguments);
+        let result = if command == "local_session" {
+            local_sessions().mint(Scope::Admin)
+                .map(serde_json::Value::String)
+                .map_err(|_| "Local dashboard session is unavailable".to_string())
+        } else {
+            match serde_json::from_str(&arguments) {
+                Ok(arguments) => match openDatastore() {
+                    Ok(store) => SYNC_CONTROL.invoke(&store, &command, arguments),
+                    Err(error) => Err(error),
+                },
+                Err(_) => Err("Invalid native operation arguments".into()),
+            }
+        };
+        let response = match result {
+            Ok(result) => json!({"result": result}),
+            Err(error) => json!({"error": error}),
+        };
+        string_to_jstring(&env, response.to_string())
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_nativePreviewLegacyMigration(
         env: JNIEnv,
         _: JClass,
     ) -> jstring {
-        let buckets = openDatastore().get_buckets().unwrap();
+        let path = match dirs::db_path(false) {
+            Ok(path) => path,
+            Err(_) => return create_error_object(&env, "local database path unavailable".into()),
+        };
+        match aw_datastore::vault::preview_plaintext(&path) {
+            Ok(preview) => string_to_jstring(
+                &env,
+                json!({"buckets": preview.buckets, "events": preview.events}).to_string(),
+            ),
+            Err(_) => create_error_object(&env, "existing database cannot be migrated as plaintext".into()),
+        }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_nativeMigrateLegacyVault(
+        env: JNIEnv,
+        _: JClass,
+        java_key: JByteArray,
+        accepted: jboolean,
+    ) -> jboolean {
+        if accepted != JNI_TRUE {
+            return JNI_FALSE;
+        }
+        let mut bytes = match env.convert_byte_array(java_key) {
+            Ok(bytes) if bytes.len() == 32 => bytes,
+            Ok(mut bytes) => {
+                bytes.fill(0);
+                return JNI_FALSE;
+            }
+            Err(_) => return JNI_FALSE,
+        };
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        bytes.fill(0);
+        let hex_key = Zeroizing::new(key_as_hex(&key));
+        key.fill(0);
+        let path = match dirs::db_path(false) {
+            Ok(path) => path,
+            Err(_) => return JNI_FALSE,
+        };
+        match aw_datastore::vault::migrate_plaintext(&path, hex_key.as_str()) {
+            Ok(_) => JNI_TRUE,
+            Err(_) => JNI_FALSE,
+        }
+    }
+
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_nativeGetBuckets(
+        env: JNIEnv,
+        _: JClass,
+    ) -> jstring {
+        let buckets = openDatastore().expect("vault must be initialized before use").get_buckets().unwrap();
         string_to_jstring(&env, json!(buckets).to_string())
     }
 
     #[no_mangle]
-    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_createBucket(
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_nativeCreateBucket(
         env: JNIEnv,
         _: JClass,
         java_bucket: JString,
@@ -194,7 +368,7 @@ pub mod android {
             Ok(json) => json,
             Err(err) => return create_error_object(&env, err.to_string()),
         };
-        match openDatastore().create_bucket(&bucket_json) {
+        match openDatastore().expect("vault must be initialized before use").create_bucket(&bucket_json) {
             Ok(()) => string_to_jstring(&env, "Bucket successfully created".to_string()),
             Err(e) => create_error_object(
                 &env,
@@ -204,7 +378,7 @@ pub mod android {
     }
 
     #[no_mangle]
-    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_heartbeat(
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_nativeHeartbeat(
         env: JNIEnv,
         _: JClass,
         java_bucket_id: JString,
@@ -218,7 +392,7 @@ pub mod android {
             Ok(json) => json,
             Err(err) => return create_error_object(&env, err.to_string()),
         };
-        match openDatastore().heartbeat(&bucket_id, event_json, pulsetime) {
+        match openDatastore().expect("vault must be initialized before use").heartbeat(&bucket_id, event_json, pulsetime) {
             Ok(_) => string_to_jstring(&env, "Heartbeat successfully received".to_string()),
             Err(e) => create_error_object(
                 &env,
@@ -231,7 +405,7 @@ pub mod android {
     }
 
     #[no_mangle]
-    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_getEvents(
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_nativeGetEvents(
         env: JNIEnv,
         _: JClass,
         java_bucket_id: JString,
@@ -239,7 +413,7 @@ pub mod android {
     ) -> jstring {
         let bucket_id = jstring_to_string(&env, java_bucket_id);
         let limit = java_limit as u64;
-        match openDatastore().get_events(&bucket_id, None, None, Some(limit)) {
+        match openDatastore().expect("vault must be initialized before use").get_events(&bucket_id, None, None, Some(limit)) {
             Ok(events) => string_to_jstring(&env, json!(events).to_string()),
             Err(e) => create_error_object(
                 &env,
@@ -249,7 +423,7 @@ pub mod android {
     }
 
     #[no_mangle]
-    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_migrateHostname(
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_nativeMigrateHostname(
         env: JNIEnv,
         _: JClass,
         hostname: JString,
@@ -258,7 +432,7 @@ pub mod android {
         if hostname.is_empty() {
             return create_error_object(&env, "hostname must not be empty".to_string());
         }
-        match openDatastore().migrate_hostname(&hostname) {
+        match openDatastore().expect("vault must be initialized before use").migrate_hostname(&hostname) {
             Ok(count) => {
                 string_to_jstring(&env, format!("Migrated hostname for {} bucket(s)", count))
             }
@@ -271,7 +445,7 @@ pub mod android {
         env: JNIEnv,
         _: JClass,
     ) -> jstring {
-        match openDatastore().rename_bucket("aw-android-test", "aw-android") {
+        match openDatastore().expect("vault must be initialized before use").rename_bucket("aw-android-test", "aw-android") {
             Ok(()) => string_to_jstring(
                 &env,
                 "Renamed bucket 'aw-android-test' to 'aw-android'".to_string(),
@@ -285,7 +459,7 @@ pub mod android {
         env: JNIEnv,
         _: JClass,
     ) -> jstring {
-        match openDatastore().migrate_test_bucket_names() {
+        match openDatastore().expect("vault must be initialized before use").migrate_test_bucket_names() {
             Ok(count) => string_to_jstring(
                 &env,
                 format!("Migrated {} 'aw-watcher-android-test' bucket(s)", count),
@@ -298,7 +472,7 @@ pub mod android {
     }
 
     #[no_mangle]
-    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_query(
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_nativeQuery(
         env: JNIEnv,
         _: JClass,
         java_query: JString,
@@ -311,7 +485,7 @@ pub mod android {
             Err(err) => return create_error_object(&env, err.to_string()),
         };
 
-        let datastore = openDatastore();
+        let datastore = openDatastore().expect("vault must be initialized before use");
         let mut results = Vec::new();
 
         for interval in &timeperiods {
@@ -331,7 +505,7 @@ pub mod android {
     }
 
     #[no_mangle]
-    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_androidQuery(
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_nativeAndroidQuery(
         env: JNIEnv,
         _: JClass,
         java_timeperiods: JString,
@@ -347,7 +521,11 @@ pub mod android {
         let bid_android = "aw-watcher-android".to_string();
 
         // Get classes from server settings via HTTP API
-        let classes = match AwClient::new("127.0.0.1", 5600, "aw-android-query") {
+        let query_token = match local_sessions().mint(Scope::Admin) {
+            Ok(token) => token,
+            Err(_) => return create_error_object(&env, "Local query session is unavailable".into()),
+        };
+        let classes = match AwClient::new("127.0.0.1", 5600, &query_token) {
             Ok(client) => {
                 match client.get_setting("classes") {
                     Ok(classes_value) => {
@@ -413,7 +591,7 @@ RETURN = {{"events": events, "duration": duration, "cat_events": cat_events}};"#
             build_android_canonical_events(&params)
         );
 
-        let datastore = openDatastore();
+        let datastore = openDatastore().expect("vault must be initialized before use");
         let mut results = Vec::new();
 
         for interval in &timeperiods {

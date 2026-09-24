@@ -391,6 +391,64 @@ mod query_tests {
     }
 
     #[test]
+    fn test_categorize_explained_returns_matches_and_winner() {
+        let ds = setup_datastore_populated();
+        let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
+        let code = format!(
+            r#"
+            events = query_bucket("{}");
+            events = categorize_explained(events, [
+                [["Test"], {{ "type": "regex", "regex": "^value$" }}],
+                [["Test", "First"], {{ "type": "regex", "regex": "^value$" }}],
+                [["Test", "Last"], {{ "type": "regex", "regex": "^value$" }}]
+            ]);
+            return events;"#,
+            BUCKET_ID
+        );
+        let result = aw_query::query(&code, &interval, &ds).unwrap();
+        let events: Vec<Event> = Vec::try_from(result).unwrap();
+        let trace = &events[0].data["$category_trace"];
+        assert_eq!(events[0].data["$category"], json!(["Test", "Last"]));
+        assert_eq!(trace["outcome"], "matched");
+        assert_eq!(trace["matched_rules"].as_array().unwrap().len(), 3);
+        assert_eq!(trace["selected_rule_index"], 2);
+        assert_eq!(trace["selected_category"], json!(["Test", "Last"]));
+    }
+
+    #[test]
+    fn query_bucket_limit_bounds_a_large_result_with_stable_timestamp_order() {
+        let ds = setup_datastore_with_bucket();
+        let now = chrono::Utc::now();
+        let events = (0..10_005)
+            .map(|index| {
+                let mut data = serde_json::Map::new();
+                data.insert("sequence".into(), json!(index));
+                Event::new(now + Duration::seconds(index / 2), Duration::seconds(1), data)
+            })
+            .collect::<Vec<_>>();
+        ds.insert_events(BUCKET_ID, &events).unwrap();
+        let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();
+        let code = format!(
+            r#"
+            events = query_bucket("{}", 11);
+            events = sort_by_timestamp(events);
+            fetched = event_count(events);
+            events = limit_events(events, 10);
+            return {{"events": events, "fetched": fetched}};"#,
+            BUCKET_ID
+        );
+
+        let result = serde_json::to_value(aw_query::query(&code, &interval, &ds).unwrap()).unwrap();
+        let result_events = result["events"].as_array().unwrap();
+        assert_eq!(result["fetched"], json!(11.0));
+        assert_eq!(result_events.len(), 10);
+        assert_eq!(result_events[0]["data"]["sequence"], json!(9995));
+        assert_eq!(result_events[1]["data"]["sequence"], json!(9994));
+        assert_eq!(result_events[8]["data"]["sequence"], json!(10003));
+        assert_eq!(result_events[9]["data"]["sequence"], json!(10002));
+    }
+
+    #[test]
     fn test_tag() {
         let ds = setup_datastore_populated();
         let interval = TimeInterval::new_from_string(TIME_INTERVAL).unwrap();

@@ -1,0 +1,626 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "oneOf": [
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "key_epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "object_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "vault_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key_epoch",
+        "object_id",
+        "schema_version",
+        "vault_id"
+      ],
+      "title": "SyncChunkHeaderV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "ciphertext": {
+          "type": "string"
+        },
+        "key_epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "nonce": {
+          "type": "string"
+        },
+        "object_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "vault_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ciphertext",
+        "key_epoch",
+        "nonce",
+        "object_id",
+        "schema_version",
+        "vault_id"
+      ],
+      "title": "SyncEnvelopeV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "x25519_public_key": {
+          "type": "string"
+        },
+        "ed25519_public_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "device_id",
+        "ed25519_public_key",
+        "schema_version",
+        "x25519_public_key"
+      ],
+      "title": "DevicePublicIdentityV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "bucket_type": {
+          "type": "string"
+        },
+        "client": {
+          "type": "string"
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "bucket_type",
+        "client",
+        "data"
+      ],
+      "title": "SyncBucketDescriptorV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "DevicePublicIdentityV1": {
+          "additionalProperties": false,
+          "properties": {
+            "device_id": {
+              "type": "string"
+            },
+            "schema_version": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "x25519_public_key": {
+              "type": "string"
+            },
+            "ed25519_public_key": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "device_id",
+            "ed25519_public_key",
+            "schema_version",
+            "x25519_public_key"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "challenge": {
+          "type": "string"
+        },
+        "issuer": {
+          "$ref": "#/definitions/DevicePublicIdentityV1"
+        },
+        "issuer_ephemeral_key": {
+          "type": "string"
+        },
+        "offer_id": {
+          "type": "string"
+        },
+        "recipient_device_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "challenge",
+        "issuer",
+        "issuer_ephemeral_key",
+        "offer_id",
+        "recipient_device_id",
+        "schema_version"
+      ],
+      "title": "PairingInvitationV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "DevicePublicIdentityV1": {
+          "additionalProperties": false,
+          "properties": {
+            "device_id": {
+              "type": "string"
+            },
+            "schema_version": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "x25519_public_key": {
+              "type": "string"
+            },
+            "ed25519_public_key": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "device_id",
+            "ed25519_public_key",
+            "schema_version",
+            "x25519_public_key"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "offer_id": {
+          "type": "string"
+        },
+        "recipient": {
+          "$ref": "#/definitions/DevicePublicIdentityV1"
+        },
+        "recipient_ephemeral_key": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "offer_id",
+        "recipient",
+        "recipient_ephemeral_key",
+        "schema_version"
+      ],
+      "title": "PairingResponseV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "DevicePublicIdentityV1": {
+          "additionalProperties": false,
+          "properties": {
+            "device_id": {
+              "type": "string"
+            },
+            "schema_version": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "x25519_public_key": {
+              "type": "string"
+            },
+            "ed25519_public_key": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "device_id",
+            "ed25519_public_key",
+            "schema_version",
+            "x25519_public_key"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "challenge": {
+          "type": "string"
+        },
+        "issuer": {
+          "$ref": "#/definitions/DevicePublicIdentityV1"
+        },
+        "issuer_ephemeral_key": {
+          "type": "string"
+        },
+        "offer_id": {
+          "type": "string"
+        },
+        "recipient": {
+          "$ref": "#/definitions/DevicePublicIdentityV1"
+        },
+        "recipient_ephemeral_key": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "challenge",
+        "issuer",
+        "issuer_ephemeral_key",
+        "offer_id",
+        "recipient",
+        "recipient_ephemeral_key",
+        "schema_version"
+      ],
+      "title": "PairingOfferV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "authenticator": {
+          "type": "string"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "offer_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "transcript_hash": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "authenticator",
+        "device_id",
+        "offer_id",
+        "schema_version",
+        "transcript_hash"
+      ],
+      "title": "PairingConfirmationV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "ciphertext": {
+          "type": "string"
+        },
+        "nonce": {
+          "type": "string"
+        },
+        "offer_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ciphertext",
+        "nonce",
+        "offer_id",
+        "schema_version"
+      ],
+      "title": "EncryptedKeyTransferV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "ciphertext": {
+          "type": "string"
+        },
+        "iterations": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "kdf": {
+          "type": "string"
+        },
+        "memory_kib": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "nonce": {
+          "type": "string"
+        },
+        "parallelism": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "salt": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ciphertext",
+        "iterations",
+        "kdf",
+        "memory_kib",
+        "nonce",
+        "parallelism",
+        "salt",
+        "schema_version"
+      ],
+      "title": "RecoveryKitV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "enum": [
+        "upsert",
+        "correction",
+        "tombstone",
+        "policy_change"
+      ],
+      "title": "SyncOperationKindV1",
+      "type": "string"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "enum": [
+        "put_if_absent",
+        "get",
+        "list_opaque_heads",
+        "delete_after_tombstone"
+      ],
+      "title": "SyncRelayOperationV1",
+      "type": "string"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "SyncEnvelopeV1": {
+          "additionalProperties": false,
+          "properties": {
+            "ciphertext": {
+              "type": "string"
+            },
+            "key_epoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "nonce": {
+              "type": "string"
+            },
+            "object_id": {
+              "type": "string"
+            },
+            "schema_version": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "vault_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ciphertext",
+            "key_epoch",
+            "nonce",
+            "object_id",
+            "schema_version",
+            "vault_id"
+          ],
+          "type": "object"
+        },
+        "SyncRelayOperationV1": {
+          "enum": [
+            "put_if_absent",
+            "get",
+            "list_opaque_heads",
+            "delete_after_tombstone"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "envelope": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SyncEnvelopeV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "limit": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "object_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation": {
+          "$ref": "#/definitions/SyncRelayOperationV1"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "vault_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "operation",
+        "schema_version"
+      ],
+      "title": "SyncRelayRequestV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "SyncEnvelopeV1": {
+          "additionalProperties": false,
+          "properties": {
+            "ciphertext": {
+              "type": "string"
+            },
+            "key_epoch": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "nonce": {
+              "type": "string"
+            },
+            "object_id": {
+              "type": "string"
+            },
+            "schema_version": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "vault_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ciphertext",
+            "key_epoch",
+            "nonce",
+            "object_id",
+            "schema_version",
+            "vault_id"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "deleted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "envelope": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SyncEnvelopeV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inserted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "objects": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/SyncEnvelopeV1"
+          },
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version"
+      ],
+      "title": "SyncRelayResponseV1",
+      "type": "object"
+    }
+  ],
+  "title": "PeakActivity E2EE Sync Contract V1"
+}

@@ -1,0 +1,1404 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "oneOf": [
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "destination_id": {
+          "type": "string"
+        },
+        "payload": true,
+        "purpose_id": {
+          "type": "string"
+        },
+        "retention_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "destination_id",
+        "payload",
+        "purpose_id",
+        "retention_id",
+        "schema_version"
+      ],
+      "title": "EgressRequestV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "EgressApprovalScopeV1": {
+          "enum": [
+            "once",
+            "time_limited",
+            "destination_specific"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "approval_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "destination_id": {
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "policy_version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "purpose_id": {
+          "type": "string"
+        },
+        "retention_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/definitions/EgressApprovalScopeV1"
+        }
+      },
+      "required": [
+        "approval_id",
+        "created_at",
+        "destination_id",
+        "policy_version",
+        "purpose_id",
+        "retention_id",
+        "schema_version",
+        "scope"
+      ],
+      "title": "EgressApprovalV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "EgressOutcomeV1": {
+          "enum": [
+            "allow",
+            "deny"
+          ],
+          "type": "string"
+        },
+        "EgressReasonCodeV1": {
+          "enum": [
+            "hard_deny",
+            "organization_rule",
+            "user_rule",
+            "unknown_destination",
+            "unknown_purpose",
+            "unknown_retention",
+            "invalid_policy",
+            "invalid_payload",
+            "safe_zone",
+            "after_hours",
+            "kill_switch",
+            "approval_required",
+            "approval_expired",
+            "policy_changed",
+            "secret_detected",
+            "field_removed",
+            "value_redacted",
+            "url_reduced",
+            "path_aliased",
+            "invalid_signature",
+            "destination_rejected",
+            "redirect_rejected",
+            "network_unavailable"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "outcome": {
+          "$ref": "#/definitions/EgressOutcomeV1"
+        },
+        "policy_version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "preview_id": {
+          "type": "string"
+        },
+        "reason_codes": {
+          "items": {
+            "$ref": "#/definitions/EgressReasonCodeV1"
+          },
+          "type": "array"
+        },
+        "removed_fields": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sanitized_payload": true,
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "outcome",
+        "policy_version",
+        "preview_id",
+        "reason_codes",
+        "removed_fields",
+        "schema_version"
+      ],
+      "title": "EgressDecisionV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "EgressDecisionV1": {
+          "additionalProperties": false,
+          "properties": {
+            "outcome": {
+              "$ref": "#/definitions/EgressOutcomeV1"
+            },
+            "policy_version": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "preview_id": {
+              "type": "string"
+            },
+            "reason_codes": {
+              "items": {
+                "$ref": "#/definitions/EgressReasonCodeV1"
+              },
+              "type": "array"
+            },
+            "removed_fields": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "sanitized_payload": true,
+            "schema_version": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "outcome",
+            "policy_version",
+            "preview_id",
+            "reason_codes",
+            "removed_fields",
+            "schema_version"
+          ],
+          "type": "object"
+        },
+        "EgressOutcomeV1": {
+          "enum": [
+            "allow",
+            "deny"
+          ],
+          "type": "string"
+        },
+        "EgressReasonCodeV1": {
+          "enum": [
+            "hard_deny",
+            "organization_rule",
+            "user_rule",
+            "unknown_destination",
+            "unknown_purpose",
+            "unknown_retention",
+            "invalid_policy",
+            "invalid_payload",
+            "safe_zone",
+            "after_hours",
+            "kill_switch",
+            "approval_required",
+            "approval_expired",
+            "policy_changed",
+            "secret_detected",
+            "field_removed",
+            "value_redacted",
+            "url_reduced",
+            "path_aliased",
+            "invalid_signature",
+            "destination_rejected",
+            "redirect_rejected",
+            "network_unavailable"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "decision": {
+          "$ref": "#/definitions/EgressDecisionV1"
+        },
+        "destination_id": {
+          "type": "string"
+        },
+        "destination_origin": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "purpose_id": {
+          "type": "string"
+        },
+        "retention_disclosure": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retention_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "decision",
+        "destination_id",
+        "purpose_id",
+        "retention_id",
+        "schema_version"
+      ],
+      "title": "EgressPreviewV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "EgressDestinationStatusV1": {
+          "enum": [
+            "available",
+            "beta",
+            "experimental",
+            "planned",
+            "unsupported"
+          ],
+          "type": "string"
+        },
+        "EgressDestinationV1": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_purposes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "https_origin": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/definitions/EgressDestinationStatusV1"
+            }
+          },
+          "required": [
+            "allowed_purposes",
+            "id",
+            "status"
+          ],
+          "type": "object"
+        },
+        "EgressMatchKindV1": {
+          "enum": [
+            "field",
+            "application",
+            "domain",
+            "keyword"
+          ],
+          "type": "string"
+        },
+        "EgressPatternV1": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "$ref": "#/definitions/EgressMatchKindV1"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "EgressPurposeV1": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_fields": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "destination_id": {
+              "type": "string"
+            },
+            "endpoint_path": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "retention_disclosure": {
+              "type": "string"
+            },
+            "retention_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "allowed_fields",
+            "destination_id",
+            "endpoint_path",
+            "id",
+            "retention_disclosure",
+            "retention_id"
+          ],
+          "type": "object"
+        },
+        "EgressRuleActionV1": {
+          "enum": [
+            "deny",
+            "drop_field",
+            "redact_value",
+            "domain_only",
+            "stable_alias"
+          ],
+          "type": "string"
+        },
+        "EgressRuleV1": {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "$ref": "#/definitions/EgressRuleActionV1"
+            },
+            "pattern": {
+              "$ref": "#/definitions/EgressPatternV1"
+            }
+          },
+          "required": [
+            "action",
+            "pattern"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "destinations": {
+          "items": {
+            "$ref": "#/definitions/EgressDestinationV1"
+          },
+          "type": "array"
+        },
+        "hard_deny_version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "organization_rules": {
+          "items": {
+            "$ref": "#/definitions/EgressRuleV1"
+          },
+          "type": "array"
+        },
+        "purposes": {
+          "items": {
+            "$ref": "#/definitions/EgressPurposeV1"
+          },
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "destinations",
+        "hard_deny_version",
+        "organization_rules",
+        "purposes",
+        "schema_version",
+        "version"
+      ],
+      "title": "EgressPolicyBundleV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "AfterHoursV1": {
+          "additionalProperties": false,
+          "properties": {
+            "end_minute": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "start_minute": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "weekdays": {
+              "description": "ISO weekdays: Monday=1 through Sunday=7.",
+              "items": {
+                "format": "uint8",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "end_minute",
+            "start_minute",
+            "weekdays"
+          ],
+          "type": "object"
+        },
+        "EgressDestinationStatusV1": {
+          "enum": [
+            "available",
+            "beta",
+            "experimental",
+            "planned",
+            "unsupported"
+          ],
+          "type": "string"
+        },
+        "EgressDestinationV1": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_purposes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "https_origin": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/definitions/EgressDestinationStatusV1"
+            }
+          },
+          "required": [
+            "allowed_purposes",
+            "id",
+            "status"
+          ],
+          "type": "object"
+        },
+        "EgressMatchKindV1": {
+          "enum": [
+            "field",
+            "application",
+            "domain",
+            "keyword"
+          ],
+          "type": "string"
+        },
+        "EgressPatternV1": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "$ref": "#/definitions/EgressMatchKindV1"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "EgressPurposeV1": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_fields": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "destination_id": {
+              "type": "string"
+            },
+            "endpoint_path": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "retention_disclosure": {
+              "type": "string"
+            },
+            "retention_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "allowed_fields",
+            "destination_id",
+            "endpoint_path",
+            "id",
+            "retention_disclosure",
+            "retention_id"
+          ],
+          "type": "object"
+        },
+        "EgressRuleActionV1": {
+          "enum": [
+            "deny",
+            "drop_field",
+            "redact_value",
+            "domain_only",
+            "stable_alias"
+          ],
+          "type": "string"
+        },
+        "EgressRuleV1": {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "$ref": "#/definitions/EgressRuleActionV1"
+            },
+            "pattern": {
+              "$ref": "#/definitions/EgressPatternV1"
+            }
+          },
+          "required": [
+            "action",
+            "pattern"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "added_destinations": {
+          "items": {
+            "$ref": "#/definitions/EgressDestinationV1"
+          },
+          "type": "array"
+        },
+        "added_organization_rules": {
+          "items": {
+            "$ref": "#/definitions/EgressRuleV1"
+          },
+          "type": "array"
+        },
+        "added_purposes": {
+          "items": {
+            "$ref": "#/definitions/EgressPurposeV1"
+          },
+          "type": "array"
+        },
+        "added_safe_zone_patterns": {
+          "items": {
+            "$ref": "#/definitions/EgressPatternV1"
+          },
+          "type": "array"
+        },
+        "added_user_rules": {
+          "items": {
+            "$ref": "#/definitions/EgressRuleV1"
+          },
+          "type": "array"
+        },
+        "after_hours_after": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AfterHoursV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "after_hours_before": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AfterHoursV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "changed_destinations": {
+          "items": {
+            "$ref": "#/definitions/EgressDestinationV1"
+          },
+          "type": "array"
+        },
+        "changed_purposes": {
+          "items": {
+            "$ref": "#/definitions/EgressPurposeV1"
+          },
+          "type": "array"
+        },
+        "from_version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "hard_deny_version_after": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "hard_deny_version_before": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "removed_destinations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "removed_organization_rules": {
+          "items": {
+            "$ref": "#/definitions/EgressRuleV1"
+          },
+          "type": "array"
+        },
+        "removed_purposes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "removed_safe_zone_patterns": {
+          "items": {
+            "$ref": "#/definitions/EgressPatternV1"
+          },
+          "type": "array"
+        },
+        "removed_user_rules": {
+          "items": {
+            "$ref": "#/definitions/EgressRuleV1"
+          },
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "to_version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "added_destinations",
+        "added_organization_rules",
+        "added_purposes",
+        "added_safe_zone_patterns",
+        "added_user_rules",
+        "changed_destinations",
+        "changed_purposes",
+        "from_version",
+        "hard_deny_version_after",
+        "hard_deny_version_before",
+        "removed_destinations",
+        "removed_organization_rules",
+        "removed_purposes",
+        "removed_safe_zone_patterns",
+        "removed_user_rules",
+        "schema_version",
+        "to_version"
+      ],
+      "title": "EgressPolicyDiffV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "AfterHoursV1": {
+          "additionalProperties": false,
+          "properties": {
+            "end_minute": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "start_minute": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "weekdays": {
+              "description": "ISO weekdays: Monday=1 through Sunday=7.",
+              "items": {
+                "format": "uint8",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "end_minute",
+            "start_minute",
+            "weekdays"
+          ],
+          "type": "object"
+        },
+        "EgressDestinationStatusV1": {
+          "enum": [
+            "available",
+            "beta",
+            "experimental",
+            "planned",
+            "unsupported"
+          ],
+          "type": "string"
+        },
+        "EgressDestinationV1": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_purposes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "https_origin": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/definitions/EgressDestinationStatusV1"
+            }
+          },
+          "required": [
+            "allowed_purposes",
+            "id",
+            "status"
+          ],
+          "type": "object"
+        },
+        "EgressMatchKindV1": {
+          "enum": [
+            "field",
+            "application",
+            "domain",
+            "keyword"
+          ],
+          "type": "string"
+        },
+        "EgressPatternV1": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "$ref": "#/definitions/EgressMatchKindV1"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "EgressPurposeV1": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_fields": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "destination_id": {
+              "type": "string"
+            },
+            "endpoint_path": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "retention_disclosure": {
+              "type": "string"
+            },
+            "retention_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "allowed_fields",
+            "destination_id",
+            "endpoint_path",
+            "id",
+            "retention_disclosure",
+            "retention_id"
+          ],
+          "type": "object"
+        },
+        "EgressRuleActionV1": {
+          "enum": [
+            "deny",
+            "drop_field",
+            "redact_value",
+            "domain_only",
+            "stable_alias"
+          ],
+          "type": "string"
+        },
+        "EgressRuleV1": {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "$ref": "#/definitions/EgressRuleActionV1"
+            },
+            "pattern": {
+              "$ref": "#/definitions/EgressPatternV1"
+            }
+          },
+          "required": [
+            "action",
+            "pattern"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "after_hours": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AfterHoursV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "destinations": {
+          "items": {
+            "$ref": "#/definitions/EgressDestinationV1"
+          },
+          "type": "array"
+        },
+        "hard_deny_version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "organization_rules": {
+          "items": {
+            "$ref": "#/definitions/EgressRuleV1"
+          },
+          "type": "array"
+        },
+        "purposes": {
+          "items": {
+            "$ref": "#/definitions/EgressPurposeV1"
+          },
+          "type": "array"
+        },
+        "safe_zone_patterns": {
+          "items": {
+            "$ref": "#/definitions/EgressPatternV1"
+          },
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "user_rules": {
+          "items": {
+            "$ref": "#/definitions/EgressRuleV1"
+          },
+          "type": "array"
+        },
+        "version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "destinations",
+        "hard_deny_version",
+        "organization_rules",
+        "purposes",
+        "safe_zone_patterns",
+        "schema_version",
+        "user_rules",
+        "version"
+      ],
+      "title": "EgressPolicyV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "EgressApprovalScopeV1": {
+          "enum": [
+            "once",
+            "time_limited",
+            "destination_specific"
+          ],
+          "type": "string"
+        },
+        "EgressOutcomeV1": {
+          "enum": [
+            "allow",
+            "deny"
+          ],
+          "type": "string"
+        }
+      },
+      "properties": {
+        "allowed_fields": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "decision": {
+          "$ref": "#/definitions/EgressOutcomeV1"
+        },
+        "destination_id": {
+          "type": "string"
+        },
+        "policy_version": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "purpose_id": {
+          "type": "string"
+        },
+        "retention_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/definitions/EgressApprovalScopeV1"
+        }
+      },
+      "required": [
+        "allowed_fields",
+        "created_at",
+        "decision",
+        "destination_id",
+        "policy_version",
+        "purpose_id",
+        "retention_id",
+        "schema_version",
+        "scope"
+      ],
+      "title": "EgressReceiptV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "AfterHoursV1": {
+          "additionalProperties": false,
+          "properties": {
+            "end_minute": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "start_minute": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "weekdays": {
+              "description": "ISO weekdays: Monday=1 through Sunday=7.",
+              "items": {
+                "format": "uint8",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "end_minute",
+            "start_minute",
+            "weekdays"
+          ],
+          "type": "object"
+        },
+        "EgressMatchKindV1": {
+          "enum": [
+            "field",
+            "application",
+            "domain",
+            "keyword"
+          ],
+          "type": "string"
+        },
+        "EgressPatternV1": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "$ref": "#/definitions/EgressMatchKindV1"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "EgressRuleActionV1": {
+          "enum": [
+            "deny",
+            "drop_field",
+            "redact_value",
+            "domain_only",
+            "stable_alias"
+          ],
+          "type": "string"
+        },
+        "EgressRuleV1": {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "$ref": "#/definitions/EgressRuleActionV1"
+            },
+            "pattern": {
+              "$ref": "#/definitions/EgressPatternV1"
+            }
+          },
+          "required": [
+            "action",
+            "pattern"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "after_hours": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AfterHoursV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "safe_zone_patterns": {
+          "items": {
+            "$ref": "#/definitions/EgressPatternV1"
+          },
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "user_rules": {
+          "items": {
+            "$ref": "#/definitions/EgressRuleV1"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "safe_zone_patterns",
+        "schema_version",
+        "user_rules"
+      ],
+      "title": "EgressUserPolicyV1",
+      "type": "object"
+    },
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "definitions": {
+        "EgressDestinationStatusV1": {
+          "enum": [
+            "available",
+            "beta",
+            "experimental",
+            "planned",
+            "unsupported"
+          ],
+          "type": "string"
+        },
+        "EgressDestinationV1": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_purposes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "https_origin": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/definitions/EgressDestinationStatusV1"
+            }
+          },
+          "required": [
+            "allowed_purposes",
+            "id",
+            "status"
+          ],
+          "type": "object"
+        },
+        "EgressMatchKindV1": {
+          "enum": [
+            "field",
+            "application",
+            "domain",
+            "keyword"
+          ],
+          "type": "string"
+        },
+        "EgressPatternV1": {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "$ref": "#/definitions/EgressMatchKindV1"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "EgressPolicyBundleV1": {
+          "additionalProperties": false,
+          "properties": {
+            "destinations": {
+              "items": {
+                "$ref": "#/definitions/EgressDestinationV1"
+              },
+              "type": "array"
+            },
+            "hard_deny_version": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "organization_rules": {
+              "items": {
+                "$ref": "#/definitions/EgressRuleV1"
+              },
+              "type": "array"
+            },
+            "purposes": {
+              "items": {
+                "$ref": "#/definitions/EgressPurposeV1"
+              },
+              "type": "array"
+            },
+            "schema_version": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "version": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "destinations",
+            "hard_deny_version",
+            "organization_rules",
+            "purposes",
+            "schema_version",
+            "version"
+          ],
+          "type": "object"
+        },
+        "EgressPurposeV1": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed_fields": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "destination_id": {
+              "type": "string"
+            },
+            "endpoint_path": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "retention_disclosure": {
+              "type": "string"
+            },
+            "retention_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "allowed_fields",
+            "destination_id",
+            "endpoint_path",
+            "id",
+            "retention_disclosure",
+            "retention_id"
+          ],
+          "type": "object"
+        },
+        "EgressRuleActionV1": {
+          "enum": [
+            "deny",
+            "drop_field",
+            "redact_value",
+            "domain_only",
+            "stable_alias"
+          ],
+          "type": "string"
+        },
+        "EgressRuleV1": {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "$ref": "#/definitions/EgressRuleActionV1"
+            },
+            "pattern": {
+              "$ref": "#/definitions/EgressPatternV1"
+            }
+          },
+          "required": [
+            "action",
+            "pattern"
+          ],
+          "type": "object"
+        }
+      },
+      "properties": {
+        "bundle": {
+          "$ref": "#/definitions/EgressPolicyBundleV1"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "signature": {
+          "items": {
+            "format": "uint8",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "signer_key_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "bundle",
+        "schema_version",
+        "signature",
+        "signer_key_id"
+      ],
+      "title": "SignedEgressPolicyBundleV1",
+      "type": "object"
+    }
+  ],
+  "title": "PeakActivity Egress Contract V1"
+}

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "valid_package": {
+    "schema_version": 1,
+    "manifest": {
+      "schema_version": 1,
+      "plugin_id": "sample-plugin",
+      "version": "1.0.0",
+      "publisher_key_id": "publisher-01",
+      "display_name": "Sample plugin",
+      "description": "Synthetic package fixture",
+      "capabilities": {
+        "read": [], "write": [], "network": [], "ai_features": [],
+        "storage": null, "ui": [], "background": null, "destructive": []
+      }
+    },
+    "module_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "signature": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  },
+  "invalid_manifests": [
+    {"schema_version": 1, "plugin_id": "sample-plugin", "version": "1.0.0", "publisher_key_id": "publisher-01", "display_name": "Sample", "description": "Wildcard fixture", "capabilities": {"read": [{"data_class": "raw", "bucket_type": "app", "event_type": "activity", "time_window_days": 7, "fields": ["/*"]}], "write": [], "network": [], "ai_features": [], "storage": null, "ui": [], "background": null, "destructive": []}}
+  ]
+}

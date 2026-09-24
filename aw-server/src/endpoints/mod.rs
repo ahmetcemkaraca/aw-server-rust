@@ -50,15 +50,23 @@ pub struct ServerState {
 #[macro_use]
 mod util;
 mod apikey;
+mod ai;
+mod plugins;
 mod bucket;
+mod capture;
 mod cors;
 mod export;
+mod freelancer;
+mod egress;
 mod hostcheck;
 mod import;
 mod query;
 mod settings;
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+mod sync;
 
 pub use util::HttpErrorJson;
+pub use egress::EgressPolicyTrust;
 
 #[get("/")]
 fn root_index(state: &State<ServerState>) -> Option<(ContentType, Vec<u8>)> {
@@ -93,6 +101,16 @@ fn root_favicon(state: &State<ServerState>) -> Option<(ContentType, Vec<u8>)> {
 #[get("/dark.css")]
 fn root_dark(state: &State<ServerState>) -> Option<(ContentType, Vec<u8>)> {
     get_file("dark.css".into(), state)
+}
+
+#[get("/peakactivity.svg")]
+fn root_peak_logo(state: &State<ServerState>) -> Option<(ContentType, Vec<u8>)> {
+    get_file("peakactivity.svg".into(), state)
+}
+
+#[get("/LICENSE.txt")]
+fn root_license(state: &State<ServerState>) -> Option<(ContentType, Vec<u8>)> {
+    get_file("LICENSE.txt".into(), state)
 }
 
 #[get("/logo.png")]
@@ -132,14 +150,28 @@ fn get_file(file: PathBuf, state: &State<ServerState>) -> Option<(ContentType, V
 }
 
 pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rocket<rocket::Build> {
+    build_rocket_with_policy_trust(server_state, config, EgressPolicyTrust::default())
+}
+
+pub fn build_rocket_with_policy_trust(
+    server_state: ServerState,
+    config: AWConfig,
+    egress_policy_trust: EgressPolicyTrust,
+) -> rocket::Rocket<rocket::Build> {
     info!(
         "Starting aw-server-rust at {}:{}",
         config.address, config.port
     );
+    if config.auth.sessions.is_some() {
+        assert_eq!(config.address, "127.0.0.1", "Scoped local sessions require loopback binding");
+    }
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    let sync_routes_enabled = config.auth.sessions.is_some() && server_state.datastore.is_encrypted();
     let cors = cors::cors(&config);
     let hostcheck = hostcheck::HostCheck::new(&config);
     let apikey = apikey::ApiKeyCheck::new(&config);
     let custom_static = config.custom_static.clone();
+    let egress_proxy = aw_egress::EgressProxy::new(server_state.datastore.clone());
 
     let mut rocket = rocket::custom(config.to_rocket_config())
         .attach(cors.clone())
@@ -147,7 +179,11 @@ pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rock
         .attach(apikey)
         .manage(cors)
         .manage(server_state)
+        .manage(egress_proxy)
+        .manage(egress_policy_trust)
         .manage(config)
+        .mount("/api/0/session", routes![apikey::refresh])
+        .mount("/api/0/capture", routes![capture::get, capture::set])
         .mount(
             "/",
             routes![
@@ -160,6 +196,8 @@ pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rock
                 // custom static files
                 root_dark,
                 root_logo,
+                root_peak_logo,
+                root_license,
                 root_manifest
             ],
         )
@@ -176,16 +214,62 @@ pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rock
                 bucket::bucket_events_heartbeat,
                 bucket::bucket_event_count,
                 bucket::bucket_events_get_single,
+                bucket::bucket_event_corrections,
+                bucket::bucket_event_correct,
+                bucket::bucket_event_split,
+                bucket::bucket_events_merge,
                 bucket::bucket_events_delete_by_id,
+                bucket::bucket_events_delete_range,
                 bucket::bucket_export
             ],
         )
         .mount("/api/0/query", routes![query::query])
         .mount(
             "/api/0/import",
-            routes![import::bucket_import_json, import::bucket_import_form],
+            routes![
+                import::bucket_import_preview_json,
+                import::bucket_import_preview_form,
+                import::bucket_import_json,
+                import::bucket_import_form
+            ],
         )
         .mount("/api/0/export", routes![export::buckets_export])
+        .mount("/api/0/freelancer", routes![
+            freelancer::get_workspace,
+            freelancer::update_workspace,
+            freelancer::timesheet_preview,
+            freelancer::sign_timesheet,
+        ])
+        .mount("/api/0/ai", routes![
+            ai::status,
+            ai::settings_get,
+            ai::settings_update,
+            ai::connection_test,
+            ai::preview,
+            ai::approve,
+            ai::native_preview,
+            ai::send,
+            ai::history_get,
+            ai::history_save,
+            ai::history_delete,
+        ])
+        .mount("/api/0/plugins", routes![plugins::status])
+        .mount("/api/0/egress", routes![
+            egress::status,
+            egress::receipts,
+            egress::approvals,
+            egress::user_policy,
+            egress::preview_user_policy,
+            egress::accept_user_policy,
+            egress::policy,
+            egress::policy_diff_preview,
+            egress::accept_policy,
+            egress::revoke_approvals,
+            egress::approve,
+            egress::set_kill_switch,
+            egress::preview,
+            egress::send,
+        ])
         .mount(
             "/api/0/settings",
             routes![
@@ -197,6 +281,21 @@ pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rock
         )
         .mount("/", rocket_cors::catch_all_options_routes());
 
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    if sync_routes_enabled {
+        rocket = rocket.mount("/api/0/sync", routes![
+            sync::sync_enabled,
+            sync::set_sync_enabled,
+            sync::run_sync,
+            sync::relay_request,
+            sync::put_object,
+            sync::get_object,
+            sync::list_objects,
+            sync::delete_object,
+            sync::history,
+        ]);
+    }
+
     // for each custom static directory, mount it at the given name
     for (name, dir) in custom_static {
         info!(
@@ -206,6 +305,21 @@ pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rock
         rocket = rocket.mount(&format!("/pages/{name}"), FileServer::from(dir));
     }
     rocket
+}
+
+/// Do not load a privileged WebView until this server owns its loopback socket.
+pub async fn launch_with_readiness(
+    server_state: ServerState,
+    config: AWConfig,
+    ready: std::sync::mpsc::SyncSender<Result<(), String>>,
+) -> Result<rocket::Rocket<rocket::Ignite>, rocket::Error> {
+    let notification = ready.clone();
+    let server = build_rocket(server_state, config).attach(rocket::fairing::AdHoc::on_liftoff(
+        "Local server ready", move |_| Box::pin(async move { let _ = notification.try_send(Ok(())); }),
+    ));
+    let result = server.launch().await;
+    if result.is_err() { let _ = ready.try_send(Err("The local server could not bind its selected port".into())); }
+    result
 }
 
 mod tests {

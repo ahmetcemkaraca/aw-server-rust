@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "private_markers": ["Synthetic Window Title", "https://private.example/path", "/synthetic/home/project"],
+  "request": {
+    "schema_version": 1,
+    "operation": "put_if_absent",
+    "object_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+    "vault_id": "AgICAgICAgICAgICAgICAg",
+    "envelope": {
+      "schema_version": 1,
+      "object_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+      "vault_id": "AgICAgICAgICAgICAgICAg",
+      "key_epoch": 4,
+      "nonce": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMD",
+      "ciphertext": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+    }
+  },
+  "response": {
+    "schema_version": 1,
+    "inserted": true,
+    "deleted": null,
+    "envelope": null,
+    "objects": []
+  },
+  "relay_visible_fields": ["schema_version", "operation", "object_id", "vault_id", "key_epoch", "cursor", "limit", "next_cursor", "nonce", "ciphertext_length", "ciphertext"]
+}

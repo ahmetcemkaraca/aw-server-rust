@@ -4,6 +4,7 @@
 use aw_models::Event;
 use fancy_regex::Regex;
 use lru::LruCache;
+use serde::Serialize;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -27,6 +28,72 @@ impl RuleTrait for Rule {
 
 trait RuleTrait {
     fn matches(&self, event: &Event) -> bool;
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CategoryDecisionOutcomeV1 {
+    Matched,
+    CouldNotDetermine,
+}
+
+#[derive(Serialize)]
+pub struct CategoryRuleMatchV1 {
+    pub rule_index: usize,
+    pub category_path: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct CategoryDecisionV1 {
+    pub schema_version: u32,
+    pub method_id: &'static str,
+    pub method_version: u32,
+    pub outcome: CategoryDecisionOutcomeV1,
+    pub matched_rules: Vec<CategoryRuleMatchV1>,
+    pub selected_rule_index: Option<usize>,
+    pub selected_category: Option<Vec<String>>,
+}
+
+pub fn explain_category(event: &Event, rules: &[(Vec<String>, Rule)]) -> CategoryDecisionV1 {
+    let mut matched_rules = Vec::new();
+    let mut selected: Option<(usize, Vec<String>)> = None;
+    let mut selected_depth = 1; // categorize() keeps Uncategorized when a path is empty.
+
+    for (rule_index, (category_path, rule)) in rules.iter().enumerate() {
+        if !rule.matches(event) {
+            continue;
+        }
+
+        matched_rules.push(CategoryRuleMatchV1 {
+            rule_index,
+            category_path: category_path.clone(),
+        });
+
+        if category_path.len() >= selected_depth {
+            selected_depth = category_path.len();
+            selected = Some((rule_index, category_path.clone()));
+        }
+    }
+
+    let (selected_rule_index, selected_category) = match selected {
+        Some((index, category)) => (Some(index), Some(category)),
+        None => (None, None),
+    };
+    let outcome = if selected_category.is_some() {
+        CategoryDecisionOutcomeV1::Matched
+    } else {
+        CategoryDecisionOutcomeV1::CouldNotDetermine
+    };
+
+    CategoryDecisionV1 {
+        schema_version: 1,
+        method_id: "category-rule-match",
+        method_version: 1,
+        outcome,
+        matched_rules,
+        selected_rule_index,
+        selected_category,
+    }
 }
 
 pub struct RegexRule {
@@ -117,25 +184,31 @@ impl From<Regex> for Rule {
 /// An event can only have one category, although the category may have a hierarchy,
 /// for instance: "Work -> ActivityWatch -> aw-server-rust"
 /// If multiple categories match, the deepest one will be chosen.
-pub fn categorize(mut events: Vec<Event>, rules: &[(Vec<String>, Rule)]) -> Vec<Event> {
-    let mut classified_events = Vec::new();
-    for event in events.drain(..) {
-        classified_events.push(categorize_one(event, rules));
-    }
-    classified_events
+pub fn categorize(events: Vec<Event>, rules: &[(Vec<String>, Rule)]) -> Vec<Event> {
+    categorize_with_trace(events, rules)
+        .into_iter()
+        .map(|(event, _)| event)
+        .collect()
 }
 
-fn categorize_one(mut event: Event, rules: &[(Vec<String>, Rule)]) -> Event {
-    let mut category: Vec<String> = vec!["Uncategorized".into()];
-    for (cat, rule) in rules {
-        if rule.matches(&event) {
-            category = _pick_highest_ranking_category(category, cat);
-        }
-    }
-    event
-        .data
-        .insert("$category".into(), serde_json::json!(category));
-    event
+pub fn categorize_with_trace(
+    events: Vec<Event>,
+    rules: &[(Vec<String>, Rule)],
+) -> Vec<(Event, CategoryDecisionV1)> {
+    events
+        .into_iter()
+        .map(|mut event| {
+            let decision = explain_category(&event, rules);
+            let category = decision
+                .selected_category
+                .clone()
+                .unwrap_or_else(|| vec!["Uncategorized".into()]);
+            event
+                .data
+                .insert("$category".into(), serde_json::json!(category));
+            (event, decision)
+        })
+        .collect()
 }
 
 /// Tags a list of events
@@ -161,15 +234,6 @@ fn tag_one(mut event: Event, rules: &[(String, Rule)]) -> Event {
     tags.dedup();
     event.data.insert("$tags".into(), serde_json::json!(tags));
     event
-}
-
-fn _pick_highest_ranking_category(acc: Vec<String>, item: &[String]) -> Vec<String> {
-    if item.len() >= acc.len() {
-        // If tag is category with greater or equal depth than current, then choose the new one instead.
-        item.to_vec()
-    } else {
-        acc
-    }
 }
 
 #[test]
@@ -238,6 +302,11 @@ fn test_rule_select_keys_empty_list() {
     // silently producing a rule that never matches anything.
     let result = RegexRule::new("test", false, Some(vec![]));
     assert!(result.is_err());
+}
+
+#[test]
+fn test_malformed_regex_is_rejected() {
+    assert!(RegexRule::new("[", false, None).is_err());
 }
 #[test]
 fn test_categorize() {

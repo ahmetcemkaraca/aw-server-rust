@@ -2,10 +2,15 @@
 members = [
     "aw-client-rust",
     "aw-datastore",
+    "aw-egress",
+    "aw-entitlements",
+    "aw-entitlements",
     "aw-models",
+    "aw-plugin-runtime",
     "aw-transform",
     "aw-server",
     "aw-sync",
     "aw-query",
+    "aw-sync-e2ee",
 ]
 resolver = "2"

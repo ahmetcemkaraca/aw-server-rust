@@ -1,0 +1,256 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PeakActivity AI Contract V1",
+  "oneOf": [
+    {
+      "title": "AISettingsV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "revision", "mode", "active_connection_id", "profiles"],
+      "properties": {
+        "schema_version": {"const": 1, "type": "integer"},
+        "revision": {"type": "integer", "minimum": 0},
+        "mode": {"type": "string", "enum": ["off", "peak_ai", "custom_endpoint"]},
+        "active_connection_id": {"type": ["string", "null"]},
+        "profiles": {"type": "array", "maxItems": 32, "items": {"$ref": "#/definitions/AIEndpointProfileV1"}}
+      }
+    },
+    {"$ref": "#/definitions/AIEndpointProfileV1"},
+    {"$ref": "#/definitions/SignedAIProviderRegistryV1"},
+    {"$ref": "#/definitions/AIUserRequestV1"},
+    {"$ref": "#/definitions/AIRequestPreviewV1"},
+    {"$ref": "#/definitions/AIResultV1"},
+    {"$ref": "#/definitions/AIInsightHistoryV1"}
+  ],
+  "definitions": {
+    "AIEndpointProfileV1": {
+      "title": "AIEndpointProfileV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "display_name", "origin", "endpoint_path", "protocol", "authentication", "model_id", "destination_type", "region_note", "retention_note", "training_note", "cost_note", "credential_ref", "resolved_addresses"],
+      "properties": {
+        "profile_id": {"type": "string", "maxLength": 64, "pattern": "^[a-z][a-z0-9._-]*$"},
+        "display_name": {"type": "string", "maxLength": 80},
+        "origin": {"type": "string", "format": "uri", "pattern": "^https://"},
+        "endpoint_path": {"type": "string", "maxLength": 256, "pattern": "^/"},
+        "protocol": {"type": "string", "enum": ["openai_chat_completions_v1"]},
+        "authentication": {"type": "string", "enum": ["none", "bearer"]},
+        "model_id": {"type": "string", "maxLength": 256},
+        "destination_type": {"type": "string", "enum": ["remote", "self_hosted", "lan", "paired_device", "central_sync_device"]},
+        "region_note": {"type": "string", "maxLength": 256},
+        "retention_note": {"type": "string", "maxLength": 512},
+        "training_note": {"type": "string", "maxLength": 512},
+        "cost_note": {"type": ["string", "null"], "maxLength": 512},
+        "credential_ref": {"type": ["string", "null"], "maxLength": 64},
+        "resolved_addresses": {"type": "array", "maxItems": 16, "items": {"type": "string", "format": "ip-address"}}
+      }
+    },
+    "AIProviderV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id", "display_name", "egress_destination_id", "egress_purpose_id", "model_id", "model_version", "region", "retention_id", "retention_disclosure", "training_disclosure", "subprocessors", "currency_code", "input_price_micros_per_1k", "output_price_micros_per_1k", "monthly_cap_micros"],
+      "properties": {
+        "provider_id": {"type": "string", "maxLength": 64},
+        "display_name": {"type": "string", "maxLength": 80},
+        "egress_destination_id": {"type": "string", "maxLength": 64},
+        "egress_purpose_id": {"type": "string", "maxLength": 64},
+        "model_id": {"type": "string", "maxLength": 256},
+        "model_version": {"type": "string", "maxLength": 128},
+        "region": {"type": "string", "maxLength": 128},
+        "retention_id": {"type": "string", "maxLength": 64},
+        "retention_disclosure": {"type": "string", "maxLength": 1000},
+        "training_disclosure": {"type": "string", "maxLength": 1000},
+        "subprocessors": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 256}},
+        "currency_code": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "input_price_micros_per_1k": {"type": "integer", "minimum": 0},
+        "output_price_micros_per_1k": {"type": "integer", "minimum": 0},
+        "monthly_cap_micros": {"type": "integer", "minimum": 1}
+      }
+    },
+    "SignedAIProviderRegistryV1": {
+      "title": "SignedAIProviderRegistryV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "version", "signer_key_id", "providers", "signature"],
+      "properties": {
+        "schema_version": {"const": 1, "type": "integer"},
+        "version": {"type": "integer", "minimum": 1},
+        "signer_key_id": {"type": "string", "maxLength": 64},
+        "providers": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/definitions/AIProviderV1"}},
+        "signature": {"type": "array", "minItems": 64, "maxItems": 64, "items": {"type": "integer", "minimum": 0, "maximum": 255}}
+      }
+    },
+    "AIUserRequestV1": {
+      "title": "AIUserRequestV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "profile_id", "feature", "question", "aggregate"],
+      "properties": {
+        "schema_version": {"const": 1, "type": "integer"},
+        "profile_id": {"type": "string", "maxLength": 64, "pattern": "^[a-z][a-z0-9._-]*$"},
+        "feature": {"type": "string", "enum": ["question_answer", "report_explanation", "category_suggestion", "freelancer_draft", "pattern_comparison"]},
+        "question": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "aggregate": {"type": "object"}
+      },
+      "oneOf": [
+        {"properties": {"feature": {"const": "question_answer"}, "aggregate": {"$ref": "#/definitions/AIReportAggregateV1"}}},
+        {"properties": {"feature": {"const": "report_explanation"}, "aggregate": {"$ref": "#/definitions/AIReportAggregateV1"}}},
+        {"properties": {"feature": {"const": "pattern_comparison"}, "aggregate": {"$ref": "#/definitions/AIReportAggregateV1"}}},
+        {"properties": {"feature": {"const": "category_suggestion"}, "aggregate": {"$ref": "#/definitions/AICategoryAggregateV1"}}},
+        {"properties": {"feature": {"const": "freelancer_draft"}, "aggregate": {"$ref": "#/definitions/AITimesheetAggregateV1"}}}
+      ]
+    },
+    "AIReportAggregateV1": {
+      "type": "object", "additionalProperties": false,
+      "required": ["method_id", "method_version", "break_time_seconds", "date_range", "daily", "coverage", "weekly", "monthly", "comparison"],
+      "properties": {
+        "method_id": {"type": "string", "maxLength": 4096},
+        "method_version": {"type": "integer", "minimum": 0},
+        "break_time_seconds": {"type": "integer", "minimum": 0},
+        "date_range": {"$ref": "#/definitions/AIReportDateRangeV1"},
+        "daily": {"type": "array", "maxItems": 62, "items": {"$ref": "#/definitions/AIDailySummaryV1"}},
+        "coverage": {"$ref": "#/definitions/AICoverageV1"},
+        "weekly": {"type": "array", "maxItems": 256, "items": {"$ref": "#/definitions/AIWeeklySummaryV1"}},
+        "monthly": {"type": "array", "maxItems": 256, "items": {"$ref": "#/definitions/AIMonthlySummaryV1"}},
+        "comparison": {"oneOf": [{"type": "null"}, {"$ref": "#/definitions/AIComparisonV1"}]},
+        "prior_insight": {"$ref": "#/definitions/AIPriorInsightV1"}
+      }
+    },
+    "AIReportDateRangeV1": {
+      "type": "object", "additionalProperties": false, "required": ["start_date", "end_date"],
+      "properties": {"start_date": {"type": "string", "maxLength": 4096}, "end_date": {"type": "string", "maxLength": 4096}}
+    },
+    "AIDailySummaryV1": {
+      "type": "object", "additionalProperties": false, "required": ["date", "duration_seconds", "session_count", "average_session_seconds"],
+      "properties": {
+        "date": {"type": "string", "maxLength": 4096},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "session_count": {"type": "integer", "minimum": 0},
+        "average_session_seconds": {"type": "number", "minimum": 0}
+      }
+    },
+    "AICoverageV1": {
+      "type": "object", "additionalProperties": false, "required": ["requested_periods", "periods_with_data", "limitation"],
+      "properties": {
+        "requested_periods": {"type": "integer", "minimum": 0},
+        "periods_with_data": {"type": "integer", "minimum": 0},
+        "limitation": {"type": "string", "maxLength": 4096}
+      }
+    },
+    "AIWeeklySummaryV1": {
+      "type": "object", "additionalProperties": false, "required": ["start_date", "end_date", "days_with_data", "duration_seconds"],
+      "properties": {
+        "start_date": {"type": "string", "maxLength": 4096}, "end_date": {"type": "string", "maxLength": 4096},
+        "days_with_data": {"type": "integer", "minimum": 0}, "duration_seconds": {"type": "number", "minimum": 0}
+      }
+    },
+    "AIMonthlySummaryV1": {
+      "type": "object", "additionalProperties": false, "required": ["period", "days_with_data", "duration_seconds"],
+      "properties": {
+        "period": {"type": "string", "maxLength": 4096}, "days_with_data": {"type": "integer", "minimum": 0},
+        "duration_seconds": {"type": "number", "minimum": 0}
+      }
+    },
+    "AIComparisonV1": {
+      "type": "object", "additionalProperties": false, "required": ["current", "previous", "duration_change_seconds", "duration_change_percent", "coverage_note"],
+      "properties": {
+        "current": {"$ref": "#/definitions/AIReportDateRangeV1"}, "previous": {"$ref": "#/definitions/AIReportDateRangeV1"},
+        "duration_change_seconds": {"type": "number"}, "duration_change_percent": {"type": ["number", "null"]},
+        "coverage_note": {"type": ["string", "null"], "maxLength": 4096}
+      }
+    },
+    "AIPriorInsightV1": {
+      "type": "object", "additionalProperties": false, "required": ["profile_label", "model_id", "text"],
+      "properties": {"profile_label": {"type": "string", "maxLength": 4096}, "model_id": {"type": "string", "maxLength": 4096}, "text": {"type": "string", "maxLength": 4096}}
+    },
+    "AICategoryAggregateV1": {
+      "type": "object", "additionalProperties": false, "required": ["categories", "projects", "existing_mappings"],
+      "properties": {
+        "categories": {"type": "array", "maxItems": 256, "items": {"type": "string", "maxLength": 4096}},
+        "projects": {"type": "array", "maxItems": 256, "items": {"$ref": "#/definitions/AIProjectAliasV1"}},
+        "existing_mappings": {"type": "array", "maxItems": 256, "items": {"$ref": "#/definitions/AICategoryMappingV1"}}
+      }
+    },
+    "AIProjectAliasV1": {
+      "type": "object", "additionalProperties": false, "required": ["project_alias"],
+      "properties": {"project_alias": {"type": "string", "maxLength": 64, "pattern": "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"}, "display_label": {"type": "string", "maxLength": 4096}}
+    },
+    "AICategoryMappingV1": {
+      "type": "object", "additionalProperties": false, "required": ["category", "project_alias"],
+      "properties": {"category": {"type": "string", "maxLength": 4096}, "project_alias": {"type": "string", "maxLength": 64, "pattern": "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"}}
+    },
+    "AITimesheetAggregateV1": {
+      "type": "object", "additionalProperties": false, "required": ["project_alias", "date", "approved_duration_seconds"],
+      "properties": {
+        "project_alias": {"type": "string", "maxLength": 64, "pattern": "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"}, "date": {"type": "string", "format": "date"},
+        "approved_duration_seconds": {"type": "integer", "minimum": 1, "maximum": 86400}
+      }
+    },
+    "AIRequestPreviewV1": {
+      "title": "AIRequestPreviewV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "origin", "model_id", "purpose_id", "retention_disclosure", "decision"],
+      "properties": {
+        "profile_id": {"type": "string"},
+        "origin": {"type": "string", "format": "uri"},
+        "model_id": {"type": "string"},
+        "purpose_id": {"type": "string"},
+        "retention_disclosure": {"type": "string"},
+        "decision": {"$ref": "#/definitions/EgressDecisionV1"}
+      }
+    },
+    "EgressDecisionV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "outcome", "sanitized_payload", "removed_fields", "reason_codes", "policy_version", "preview_id"],
+      "properties": {
+        "schema_version": {"const": 1, "type": "integer"},
+        "outcome": {"type": "string", "enum": ["allow", "deny"]},
+        "sanitized_payload": {},
+        "removed_fields": {"type": "array", "items": {"type": "string"}},
+        "reason_codes": {"type": "array", "items": {"type": "string"}},
+        "policy_version": {"type": "integer", "minimum": 0},
+        "preview_id": {"type": "string"}
+      }
+    },
+    "AIResultV1": {
+      "title": "AIResultV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "source_mode", "profile_label", "model_id", "text"],
+      "properties": {
+        "schema_version": {"const": 1, "type": "integer"},
+        "source_mode": {"type": "string", "enum": ["peak_ai", "custom_endpoint"]},
+        "profile_label": {"type": "string", "maxLength": 80},
+        "model_id": {"type": "string", "maxLength": 256},
+        "text": {"type": "string", "maxLength": 32768}
+      }
+    },
+    "AIInsightV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["insight_id", "created_at", "source_mode", "profile_label", "model_id", "feature", "text"],
+      "properties": {
+        "insight_id": {"type": "string", "maxLength": 64},
+        "created_at": {"type": "string", "format": "date-time"},
+        "source_mode": {"type": "string", "enum": ["peak_ai", "custom_endpoint"]},
+        "profile_label": {"type": "string", "maxLength": 80},
+        "model_id": {"type": "string", "maxLength": 256},
+        "feature": {"type": "string", "enum": ["question_answer", "report_explanation", "category_suggestion", "freelancer_draft", "pattern_comparison"]},
+        "text": {"type": "string", "maxLength": 32768}
+      }
+    },
+    "AIInsightHistoryV1": {
+      "title": "AIInsightHistoryV1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "revision", "insights"],
+      "properties": {
+        "schema_version": {"const": 1, "type": "integer"},
+        "revision": {"type": "integer", "minimum": 0},
+        "insights": {"type": "array", "maxItems": 50, "items": {"$ref": "#/definitions/AIInsightV1"}}
+      }
+    }
+  }
+}

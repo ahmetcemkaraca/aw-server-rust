@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "method_id": "category-rule-match",
+  "method_version": 1,
+  "cases": [
+    {
+      "id": "deepest-path-and-later-equal-depth-rule-wins",
+      "event": {
+        "timestamp": "2026-09-24T09:00:00Z",
+        "duration": 60,
+        "data": {"app": "Editor", "title": "Review Rust project"}
+      },
+      "rules": [
+        {"category": ["Work"], "pattern": "Editor", "keys": ["app"]},
+        {"category": ["Work", "Programming"], "pattern": "Rust", "keys": ["title"]},
+        {"category": ["Work", "Writing"], "pattern": "Review", "keys": ["title"]}
+      ],
+      "expected": {
+        "schema_version": 1,
+        "method_id": "category-rule-match",
+        "method_version": 1,
+        "outcome": "matched",
+        "matched_rules": [
+          {"rule_index": 0, "category_path": ["Work"]},
+          {"rule_index": 1, "category_path": ["Work", "Programming"]},
+          {"rule_index": 2, "category_path": ["Work", "Writing"]}
+        ],
+        "selected_rule_index": 2,
+        "selected_category": ["Work", "Writing"]
+      }
+    },
+    {
+      "id": "no-match-abstains",
+      "event": {
+        "timestamp": "2026-09-24T09:00:00Z",
+        "duration": 60,
+        "data": {"app": "Editor", "title": "Review Rust project"}
+      },
+      "rules": [
+        {"category": ["Personal", "Mail"], "pattern": "mail", "keys": ["app"]}
+      ],
+      "expected": {
+        "schema_version": 1,
+        "method_id": "category-rule-match",
+        "method_version": 1,
+        "outcome": "could_not_determine",
+        "matched_rules": [],
+        "selected_rule_index": null,
+        "selected_category": null
+      }
+    }
+  ]
+}

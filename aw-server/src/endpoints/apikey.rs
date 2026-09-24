@@ -19,12 +19,14 @@
 //! the browser can obtain allowed headers before sending the actual request.
 
 use subtle::ConstantTimeEq;
+use std::sync::Mutex;
+use crate::sessions::{Sessions, TOKEN_HEADER};
 
 use rocket::fairing::Fairing;
 use rocket::http::uri::Origin;
-use rocket::http::{Method, Status};
+use rocket::http::{Header, Method, RawStr, Status};
 use rocket::route::Outcome;
-use rocket::{Data, Request, Rocket, Route};
+use rocket::{Data, Request, Response, Rocket, Route};
 
 use crate::config::AWConfig;
 use crate::endpoints::HttpErrorJson;
@@ -34,8 +36,40 @@ static FAIRING_ROUTE_BASE: &str = "/apikey_fairing";
 /// Paths that are always accessible without authentication.
 const PUBLIC_PATHS: &[&str] = &["/api/0/info"];
 
+#[derive(Default)]
+struct Decision {
+    status: Option<Status>,
+    rotated: Option<String>,
+    ingest_only: bool,
+    ai_send_only: bool,
+    credential: Option<String>,
+}
+
+pub struct IngestOnly(pub bool);
+
+#[rocket::async_trait]
+impl<'r> rocket::request::FromRequest<'r> for IngestOnly {
+    type Error = std::convert::Infallible;
+    async fn from_request(request: &'r Request<'_>) -> rocket::request::Outcome<Self, Self::Error> {
+        let ingest = request.local_cache(|| Mutex::new(Decision::default())).lock().unwrap().ingest_only;
+        rocket::request::Outcome::Success(IngestOnly(ingest))
+    }
+}
+
+pub struct AiSendOnly(pub bool);
+
+#[rocket::async_trait]
+impl<'r> rocket::request::FromRequest<'r> for AiSendOnly {
+    type Error = std::convert::Infallible;
+    async fn from_request(request: &'r Request<'_>) -> rocket::request::Outcome<Self, Self::Error> {
+        let allowed = request.local_cache(|| Mutex::new(Decision::default())).lock().unwrap().ai_send_only;
+        rocket::request::Outcome::Success(AiSendOnly(allowed))
+    }
+}
+
 pub struct ApiKeyCheck {
     api_key: Option<String>,
+    sessions: Option<Sessions>,
 }
 
 impl ApiKeyCheck {
@@ -47,7 +81,7 @@ impl ApiKeyCheck {
             }
             other => other.clone(),
         };
-        ApiKeyCheck { api_key }
+        ApiKeyCheck { api_key, sessions: config.auth.sessions.clone() }
     }
 }
 
@@ -63,8 +97,8 @@ impl rocket::route::Handler for FairingErrorRoute {
         _: rocket::Data<'r>,
     ) -> rocket::route::Outcome<'r> {
         let err = HttpErrorJson::new(
-            Status::Unauthorized,
-            "Missing or invalid API key. Set 'Authorization: Bearer <key>' header.".to_string(),
+            request.local_cache(|| Mutex::new(Decision::default())).lock().unwrap().status.unwrap_or(Status::Unauthorized),
+            "Local request was denied. Set 'Authorization: Bearer <key>' header.".to_string(),
         );
         Outcome::from(request, err)
     }
@@ -86,14 +120,14 @@ impl Fairing for ApiKeyCheck {
     fn info(&self) -> rocket::fairing::Info {
         rocket::fairing::Info {
             name: "ApiKeyCheck",
-            kind: rocket::fairing::Kind::Ignite | rocket::fairing::Kind::Request,
+            kind: rocket::fairing::Kind::Ignite | rocket::fairing::Kind::Request | rocket::fairing::Kind::Response,
         }
     }
 
     async fn on_ignite(&self, rocket: Rocket<rocket::Build>) -> rocket::fairing::Result {
-        match &self.api_key {
-            Some(_) => Ok(rocket.mount(FAIRING_ROUTE_BASE, vec![fairing_route()])),
-            None => {
+        match (&self.api_key, &self.sessions) {
+            (Some(_), _) | (_, Some(_)) => Ok(rocket.mount(FAIRING_ROUTE_BASE, vec![fairing_route()])),
+            (None, None) => {
                 debug!("API key authentication is disabled");
                 Ok(rocket)
             }
@@ -101,6 +135,44 @@ impl Fairing for ApiKeyCheck {
     }
 
     async fn on_request(&self, request: &mut Request<'_>, _: &mut Data<'_>) {
+        if let Some(sessions) = &self.sessions {
+            let path = match RawStr::new(request.uri().path().as_str()).percent_decode() {
+                Ok(path) => path.into_owned(),
+                Err(_) => { redirect_unauthorized(request); return; }
+            };
+            if !path.trim_start_matches('/').starts_with("api/") { return; }
+            let origin = request.headers().get_one("Origin");
+            let query_credentials = request.uri().query().is_some_and(|query| query.as_str().split('&').any(|field| {
+                let key = RawStr::new(field.split('=').next().unwrap_or("")).url_decode_lossy();
+                matches!(key.as_ref(), "token" | "api_key" | "access_token")
+            }));
+            let result = if query_credentials { Err(Status::BadRequest) }
+            else if !sessions.origin_allowed(origin) { Err(Status::Forbidden) }
+            else if request.method() == Method::Options { return; }
+            else if path == "/api/0/session/refresh" && request.method() == Method::Post { return; }
+            else if request.headers().get("Authorization").count() != 1 { Err(Status::Unauthorized) }
+            else {
+                match request.headers().get_one("Authorization").and_then(|value| value.strip_prefix("Bearer ")) {
+                    Some(token) => sessions.authorize(token, request.method(), &path, origin),
+                    None => Err(Status::Unauthorized),
+                }
+            };
+            match result {
+                Ok(access) => {
+                    let mut decision = request.local_cache(|| Mutex::new(Decision::default())).lock().unwrap();
+                    decision.rotated = access.rotated;
+                    decision.ingest_only = access.ingest_only;
+                    decision.ai_send_only = access.ai_send_only;
+                    decision.credential = request.headers().get_one("Authorization")
+                        .and_then(|value| value.strip_prefix("Bearer ")).map(str::to_string);
+                }
+                Err(status) => {
+                    request.local_cache(|| Mutex::new(Decision::default())).lock().unwrap().status = Some(status);
+                    redirect_unauthorized(request);
+                }
+            }
+            return;
+        }
         let api_key = match &self.api_key {
             None => return, // auth disabled
             Some(k) => k,
@@ -111,7 +183,11 @@ impl Fairing for ApiKeyCheck {
             return;
         }
 
-        let path = request.uri().path().as_str();
+        let decoded_path = match RawStr::new(request.uri().path().as_str()).percent_decode() {
+            Ok(path) => path,
+            Err(_) => { redirect_unauthorized(request); return; }
+        };
+        let path = decoded_path.as_ref();
 
         // Normalize leading slashes to prevent bypass via `//api/...`
         let normalized_path = format!("/{}", path.trim_start_matches('/'));
@@ -141,10 +217,37 @@ impl Fairing for ApiKeyCheck {
         };
 
         if !valid {
-            debug!("API key check failed for {}", request.uri());
+            debug!("API key check failed");
             redirect_unauthorized(request);
         }
     }
+    async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
+        if let Some(sessions) = &self.sessions {
+            response.set_header(Header::new("Cache-Control", "no-store"));
+            let decision = request.local_cache(|| Mutex::new(Decision::default())).lock().unwrap();
+            if decision.credential.as_ref().is_some_and(|token| !sessions.token_alive(token)) {
+                response.set_status(Status::Unauthorized);
+                response.set_header(rocket::http::ContentType::JSON);
+                response.set_sized_body(None, std::io::Cursor::new(b"{\"message\":\"The local session ended\"}"));
+                return;
+            }
+            if let Some(token) = &decision.rotated {
+                response.set_header(Header::new(TOKEN_HEADER, token.clone()));
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshRequest { refresh_token: String }
+
+#[post("/refresh", data = "<request>", format = "json")]
+pub fn refresh(request: rocket::serde::json::Json<RefreshRequest>, config: &rocket::State<AWConfig>)
+    -> Result<rocket::serde::json::Json<serde_json::Value>, Status> {
+    let sessions = config.auth.sessions.as_ref().ok_or(Status::NotFound)?;
+    let access = sessions.renew(&request.refresh_token)?;
+    Ok(rocket::serde::json::Json(serde_json::json!({"access_token": access})))
 }
 
 #[cfg(test)]

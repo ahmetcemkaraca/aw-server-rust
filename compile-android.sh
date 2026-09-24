@@ -112,9 +112,5 @@ for archtargetstr in \
 
     # Build aw-server
     echo "Building aw-server for $arch..."
-    cargo build -p aw-server --target "$target" --lib "${release_args[@]}"
-
-    # Build aw-sync (without cli feature for Android)
-    echo "Building aw-sync for $arch..."
-    cargo build -p aw-sync --target "$target" --lib --no-default-features "${release_args[@]}"
+    cargo build -p aw-server --target "$target" --lib --no-default-features --features encryption-vendored "${release_args[@]}"
 done

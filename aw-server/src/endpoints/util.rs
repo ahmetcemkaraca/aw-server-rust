@@ -72,6 +72,12 @@ use aw_datastore::DatastoreError;
 impl From<DatastoreError> for HttpErrorJson {
     fn from(val: DatastoreError) -> Self {
         match val {
+            DatastoreError::Locked => HttpErrorJson::new(Status::Locked, "The local vault is locked".into()),
+            DatastoreError::NoSuchEvent(event_id) => HttpErrorJson::new(Status::NotFound, format!("Event '{event_id}' does not exist")),
+            DatastoreError::InvalidImport(message) => HttpErrorJson::new(Status::BadRequest, message),
+            DatastoreError::InvalidTimeRange => HttpErrorJson::new(Status::BadRequest, "The requested time range is invalid".into()),
+            DatastoreError::InvalidCorrection(message) => HttpErrorJson::new(Status::BadRequest, message),
+            DatastoreError::InvalidRetentionPolicy => HttpErrorJson::new(Status::BadRequest, "Raw retention must be between 0 and 3650 days".into()),
             DatastoreError::NoSuchBucket(bucket_id) => HttpErrorJson::new(
                 Status::NotFound,
                 format!("The requested bucket '{bucket_id}' does not exist"),

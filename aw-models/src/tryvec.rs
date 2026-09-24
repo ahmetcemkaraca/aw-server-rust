@@ -56,14 +56,26 @@ impl<T: JsonSchema> TryVec<T> {
     }
 
     pub fn take_inner(self) -> Vec<T> {
+        self.take_inner_with_skipped().0
+    }
+
+    pub fn take_inner_with_skipped(self) -> (Vec<T>, usize) {
         let mut vec: Vec<T> = Vec::new();
+        let mut skipped = 0;
         for item in self.inner {
             match item {
                 TryParse::Parsed(i) => vec.push(i),
-                _ => continue,
+                _ => skipped += 1,
             };
         }
-        vec
+        (vec, skipped)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.inner.iter().filter_map(|item| match item {
+            TryParse::Parsed(value) => Some(value),
+            TryParse::Unparsed(_) | TryParse::NotPresent => None,
+        })
     }
 }
 
@@ -200,8 +212,22 @@ mod test {
     }
 
     #[test]
+    fn iter_yields_only_parsed_values() {
+        let events = serde_json::from_str::<TryVec<TestEvent>>(r#"[{"data":"ok"},{"data":1}]"#).unwrap();
+        assert_eq!(events.iter().count(), 1);
+    }
+
+    #[test]
     fn test_methods() {
         let tryvec = TryVec::<TestEvent>::new_empty();
         assert_eq!(tryvec.take_inner().len(), Vec::<TestEvent>::new().len());
+    }
+
+    #[test]
+    fn take_inner_reports_unparsed_events_as_skipped() {
+        let tryvec = serde_json::from_str::<TryVec<TestEvent>>(r#"[{"data":"kept"},{"data":2}]"#).unwrap();
+        let (events, skipped) = tryvec.take_inner_with_skipped();
+        assert_eq!(events.len(), 1);
+        assert_eq!(skipped, 1);
     }
 }

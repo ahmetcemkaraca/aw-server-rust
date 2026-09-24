@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use aw_client_rust::blocking::AwClient;
 use chrono::{DateTime, Utc};
-use reqwest::StatusCode;
 
 use aw_datastore::{Datastore, DatastoreError};
 use aw_models::{Bucket, Event};
@@ -74,8 +73,7 @@ impl AccessMethod for AwClient {
             Ok(bucket) => Ok(bucket),
             Err(e) => {
                 warn!("{:?}", e);
-                let code = e.status().unwrap();
-                if code == StatusCode::NOT_FOUND {
+                if e.status().is_some_and(|status| status.as_u16() == 404) {
                     Err(DatastoreError::NoSuchBucket(bucket_id.into()))
                 } else {
                     panic!("Unexpected error");

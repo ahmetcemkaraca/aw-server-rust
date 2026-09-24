@@ -42,6 +42,10 @@ pub fn fill_env(env: &mut VarEnv) {
         DataType::Function("limit_events".to_string(), qfunctions::limit_events),
     );
     env.insert(
+        "event_count".to_string(),
+        DataType::Function("event_count".to_string(), qfunctions::event_count),
+    );
+    env.insert(
         "contains".to_string(),
         DataType::Function("contains".to_string(), qfunctions::contains),
     );
@@ -102,6 +106,10 @@ pub fn fill_env(env: &mut VarEnv) {
         DataType::Function("categorize".into(), qfunctions::categorize),
     );
     env.insert(
+        "categorize_explained".to_string(),
+        DataType::Function("categorize_explained".into(), qfunctions::categorize_explained),
+    );
+    env.insert(
         "tag".to_string(),
         DataType::Function("tag".into(), qfunctions::tag),
     );
@@ -142,16 +150,20 @@ mod qfunctions {
         ds: &Datastore,
     ) -> Result<DataType, QueryError> {
         // Typecheck
-        validate::args_length(&args, 1)?;
-
-        let bucket_id: String = args.into_iter().next().unwrap().try_into()?;
+        validate::args_length(&args, 1).or_else(|_| validate::args_length(&args, 2))?;
+        let mut args = args.into_iter();
+        let bucket_id: String = args.next().unwrap().try_into()?;
+        let limit: Option<usize> = args.next().map(TryInto::try_into).transpose()?;
+        let limit = limit
+            .map(|value| u64::try_from(value).map_err(|_| QueryError::InvalidFunctionParameters("query_bucket limit is too large".into())))
+            .transpose()?;
         let interval = validate::get_timeinterval(env)?;
 
         let events = match ds.get_events(
             bucket_id.as_str(),
             Some(*interval.start()),
             Some(*interval.end()),
-            None,
+            limit,
         ) {
             Ok(events) => events,
             Err(e) => {
@@ -296,6 +308,28 @@ mod qfunctions {
         Ok(DataType::List(tagged_flooded_events))
     }
 
+    pub fn categorize_explained(
+        args: Vec<DataType>,
+        _env: &VarEnv,
+        _ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        validate::args_length(&args, 2)?;
+        let mut args = args.into_iter();
+        let events: Vec<Event> = args.next().unwrap().try_into()?;
+        let rules: Vec<(Vec<String>, Rule)> = args.next().unwrap().try_into()?;
+        let result = aw_transform::classify::categorize_with_trace(events, &rules)
+            .into_iter()
+            .map(|(mut event, trace)| {
+                event.data.insert(
+                    "$category_trace".into(),
+                    serde_json::to_value(trace).expect("category trace is serializable"),
+                );
+                DataType::Event(event)
+            })
+            .collect();
+        Ok(DataType::List(result))
+    }
+
     pub fn tag(
         args: Vec<DataType>,
         _env: &VarEnv,
@@ -354,6 +388,16 @@ mod qfunctions {
             limited_tagged_events.push(DataType::Event(event));
         }
         Ok(DataType::List(limited_tagged_events))
+    }
+
+    pub fn event_count(
+        args: Vec<DataType>,
+        _env: &VarEnv,
+        _ds: &Datastore,
+    ) -> Result<DataType, QueryError> {
+        validate::args_length(&args, 1)?;
+        let events: Vec<Event> = args.into_iter().next().unwrap().try_into()?;
+        Ok(DataType::Number(events.len() as f64))
     }
 
     pub fn sort_by_timestamp(

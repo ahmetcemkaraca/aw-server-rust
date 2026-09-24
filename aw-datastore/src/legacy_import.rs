@@ -195,7 +195,7 @@ mod import {
         assert!(dbfile_path().exists());
         let mut new_conn =
             Connection::open_in_memory().expect("Unable to open corrupt legacy db file");
-        let mut ds = DatastoreInstance::new(&mut new_conn, true).unwrap();
+        let mut ds = DatastoreInstance::new(&mut new_conn, true, false).unwrap();
         assert!(
             ds.ensure_legacy_import(&new_conn).unwrap(),
             "Failed to ensure legacy import"

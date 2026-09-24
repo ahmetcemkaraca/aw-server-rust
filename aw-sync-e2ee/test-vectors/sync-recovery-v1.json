@@ -1,0 +1,16 @@
+{
+  "source": "RFC 9106 memory-constrained Argon2id profile",
+  "source_url": "https://www.rfc-editor.org/rfc/rfc9106.html#section-4",
+  "profile": {
+    "schema_version": 1,
+    "kdf": "argon2id-v19",
+    "memory_kib": 65536,
+    "iterations": 3,
+    "parallelism": 4,
+    "salt_bytes": 16,
+    "derived_key_bytes": 32,
+    "aead": "XChaCha20-Poly1305",
+    "nonce_bytes": 24,
+    "chunk_limit_bytes": 1048576
+  }
+}
