@@ -55,7 +55,7 @@ fn _get_db_version(conn: &Connection) -> i32 {
         .unwrap()
 }
 
-fn with_savepoint<T>(
+pub(crate) fn with_savepoint<T>(
     conn: &Connection,
     name: &str,
     operation: impl FnOnce() -> Result<T, DatastoreError>,
@@ -177,8 +177,10 @@ fn validate_egress_user_policy(user: &EgressUserPolicyV1) -> Result<(), Datastor
  * 10: Added signed device identities, bucket/event mappings and per-device sync streams
  * 11: Added encrypted plugin-owned storage
  * 12: Added schema-checked plugin-owned annotation events
+ * 13: Added installed packages, one-time write approvals and content-free access history
+ * 14: Added scoped pending action queue; old pending approvals are invalidated
  */
-static NEWEST_DB_VERSION: i32 = 12;
+static NEWEST_DB_VERSION: i32 = 14;
 const EGRESS_KILL_SWITCH_KEY: &str = "egress.kill_switch";
 const EGRESS_ALIAS_SECRET_KEY: &str = "egress.alias_secret";
 const EGRESS_APPROVAL_SECRET_KEY: &str = "egress.approval_secret";
@@ -243,6 +245,24 @@ fn _create_tables(conn: &Connection, version: i32, encrypted: bool) -> bool {
 
     if version < 12 {
         _migrate_v11_to_v12(conn);
+    }
+
+    if version < 13 {
+        conn.execute_batch("BEGIN EXCLUSIVE TRANSACTION;
+            CREATE TABLE installed_plugins(plugin_id TEXT PRIMARY KEY, state_json TEXT NOT NULL, package_json TEXT NOT NULL, module BLOB NOT NULL);
+            CREATE TABLE plugin_pending_writes(invocation_id TEXT PRIMARY KEY, plugin_id TEXT NOT NULL, package_sha256 TEXT NOT NULL, writes_json TEXT NOT NULL, expires_at INTEGER NOT NULL);
+            CREATE TABLE plugin_access(id INTEGER PRIMARY KEY AUTOINCREMENT, plugin_id TEXT NOT NULL, package_sha256 TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL);
+            CREATE INDEX plugin_access_owner ON plugin_access(plugin_id,id DESC);
+            CREATE TABLE plugin_local_revocations(package_sha256 TEXT PRIMARY KEY);
+            PRAGMA user_version = 13; COMMIT;").expect("Failed to add plugin lifecycle state");
+    }
+
+    if version < 14 {
+        conn.execute_batch("BEGIN EXCLUSIVE TRANSACTION;
+            DELETE FROM plugin_pending_writes;
+            ALTER TABLE plugin_pending_writes RENAME TO plugin_pending_invocations;
+            ALTER TABLE plugin_pending_invocations RENAME COLUMN writes_json TO prepared_json;
+            PRAGMA user_version = 14; COMMIT;").expect("Failed to add plugin pending action queue");
     }
 
     first_init
@@ -4471,7 +4491,7 @@ mod egress_migration_tests {
             [],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 14);
         assert_eq!(setting, "value");
         assert_eq!(table_count, 1);
         let approvals: i64 = conn.query_row(
@@ -4527,7 +4547,7 @@ mod sync_v12_migration_tests {
 
         DatastoreInstance::new(&conn, true, false).unwrap();
 
-        assert_eq!(_get_db_version(&conn), 12);
+        assert_eq!(_get_db_version(&conn), 14);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM buckets", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
         let signing_seed: Option<Vec<u8>> = conn.query_row(
@@ -4554,6 +4574,7 @@ mod sync_v12_migration_tests {
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM sync_bucket_mappings", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'plugin_storage'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'plugin_events'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'installed_plugins'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
     }
 
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]

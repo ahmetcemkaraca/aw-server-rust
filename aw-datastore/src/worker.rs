@@ -132,6 +132,8 @@ impl fmt::Debug for Datastore {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum Response {
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    Plugin(crate::plugins::PluginResultV1),
     Empty(),
     Bucket(Bucket),
     BucketMap(HashMap<String, Bucket>),
@@ -212,6 +214,8 @@ pub struct ImportSummary {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub(crate) enum Command {
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    Plugin(crate::plugins::PluginOperationV1),
     CreateBucket(Bucket),
     DeleteBucket(String),
     GetBucket(String),
@@ -374,7 +378,8 @@ impl Command {
         {
             matches!(
                 self,
-                Self::GetPluginStorage(_)
+                Self::Plugin(_)
+                    | Self::GetPluginStorage(_)
                     | Self::ApplyPluginStorageIntents(_, _)
                     | Self::DeletePluginStorage(_)
                     | Self::GetPluginEvents(_)
@@ -650,7 +655,12 @@ impl DatastoreWorker {
                 let ack_after_commit = ack_after_commit
                     || matches!(
                         &request,
-                        Command::CreateSyncDeviceIdentity(_)
+                        Command::Plugin(_)
+                            | Command::ApplyPluginStorageIntents(_, _)
+                            | Command::DeletePluginStorage(_)
+                            | Command::ApplyPluginWriteIntents(_, _)
+                            | Command::DeletePluginData(_)
+                            | Command::CreateSyncDeviceIdentity(_)
                             | Command::InstallSyncKeyMaterial(_)
                             | Command::RestoreSyncSnapshotData(_)
                             | Command::RestoreSyncRecoveryData(_, _, _, _, _)
@@ -1340,6 +1350,12 @@ impl DatastoreWorker {
                 Ok(result) => Ok(Response::KeyValues(result)),
                 Err(e) => Err(e),
             },
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            Command::Plugin(operation) => {
+                let result = crate::datastore::with_savepoint(tx, "plugin_lifecycle", || ds.plugin_operation(tx, operation))?;
+                self.commit = true;
+                Ok(Response::Plugin(result))
+            }
             #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
             Command::GetPluginStorage(manifest) => ds.get_plugin_storage(tx, &manifest)
                 .map(Response::PluginStorage),
@@ -2571,6 +2587,15 @@ impl Datastore {
         match self.request(cmd)? {
             Response::KeyValues(value) => Ok(value),
             _ => panic!("Invalid response"),
+        }
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn plugin_operation(&self, operation: crate::plugins::PluginOperationV1) -> Result<crate::plugins::PluginResultV1, DatastoreError> {
+        if !self.is_encrypted() { return Err(DatastoreError::InternalError("Plugins require an encrypted vault".into())); }
+        match self.request(Command::Plugin(operation))? {
+            Response::Plugin(result) => Ok(result),
+            _ => Err(DatastoreError::InternalError("Unexpected plugin lifecycle response".into())),
         }
     }
 

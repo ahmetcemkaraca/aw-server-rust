@@ -178,6 +178,15 @@ impl EgressProxy {
         Ok(update())
     }
 
+    /// Serialize plugin revocation/update with sends and invalidate outstanding approvals.
+    /// ponytail: all previews are invalidated; add owner-indexed previews if this disrupts users.
+    pub fn with_plugin_change<T>(&self, update: impl FnOnce() -> T) -> Result<T, EgressReasonCodeV1> {
+        let _gate = self.send_gate.write().map_err(|_| EgressReasonCodeV1::KillSwitch)?;
+        self.previews.lock().map_err(|_| EgressReasonCodeV1::InvalidPolicy)?.clear();
+        self.datastore.clear_egress_approvals().map_err(|_| EgressReasonCodeV1::InvalidPolicy)?;
+        Ok(update())
+    }
+
     pub fn kill_switch_enabled(&self) -> Result<bool, EgressReasonCodeV1> {
         self.datastore.egress_kill_switch().map_err(|_| EgressReasonCodeV1::KillSwitch)
     }
@@ -1410,6 +1419,33 @@ mod tests {
         let receipt = serde_json::to_string(&receipt).unwrap();
         assert!(!receipt.contains("synthetic-bearer-secret"));
         assert!(!receipt.contains("ai.example.invalid"));
+    }
+
+    #[test]
+    fn plugin_change_invalidates_pending_outbound_approvals_before_mutation() {
+        let store = Datastore::new_in_memory(true);
+        let body = Arc::new(Mutex::new(Vec::new()));
+        let proxy = EgressProxy::with_transport(store.clone(), AITransport { body: body.clone(), auth: Arc::new(Mutex::new(None)) });
+        proxy.set_kill_switch(false).unwrap();
+        let profile = custom_endpoint_profile();
+        let policy = custom_endpoint_policy().for_custom_endpoint(&profile).unwrap();
+        let now = Utc::now();
+        let preview = proxy.preview_custom_ai(&policy, EgressRequestV1 {
+            schema_version: 1, destination_id: policy.custom_endpoint_destination_id().unwrap(),
+            purpose_id: "ai.custom_endpoint".into(), retention_id: "user-defined".into(),
+            payload: serde_json::json!({"question":"Summarize this report","aggregate":{
+                "method_id":"local-work-report","method_version":1,"break_time_seconds":300,
+                "date_range":{"start_date":"2026-09-01","end_date":"2026-09-01"},
+                "daily":[],"weekly":[],"monthly":[],"comparison":null,
+                "coverage":{"requested_periods":1,"periods_with_data":1,"limitation":"complete"}
+            }}),
+        }, AIRequestFeatureV1::ReportExplanation, now, 0);
+        let approved = proxy.approve(&policy, &preview.preview_id, EgressApprovalScopeV1::Once, Some(now + Duration::minutes(5)), now, 0).unwrap();
+        proxy.with_plugin_change(|| {
+            assert!(store.get_egress_approval(approved.approval_id(), now).unwrap().is_none());
+        }).unwrap();
+        assert!(proxy.send_custom_ai_approval(&policy, &profile, &preview.preview_id, approved.approval_id(), Some("synthetic-secret"), now, 0).is_err());
+        assert!(body.lock().unwrap().is_empty());
     }
 
     #[test]
