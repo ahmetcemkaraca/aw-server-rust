@@ -508,7 +508,7 @@ pub fn validate_plugin_output_v1(
                 .map_or(true, |bytes| bytes.len() > PLUGIN_MAX_INTENT_PAYLOAD_BYTES_V1))
     }) || output.destructive.iter().any(|intent| {
         !manifest.capabilities.destructive.iter().any(|grant| grant.action == intent.action && grant.confirmation_required)
-            || !valid_text(&intent.resource_id, 128, true)
+            || !plugin_destructive_target_allowed_v1(intent, output.network.len())
         }) {
         return Err(PluginContractErrorV1::CapabilityDenied);
     }
@@ -621,4 +621,53 @@ fn valid_domain(value: &str) -> bool {
             && (label.as_bytes()[label.len() - 1].is_ascii_lowercase() || label.as_bytes()[label.len() - 1].is_ascii_digit())
             && label.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     })
+}
+
+/// Domain-separated canonical signed-package bytes shared by host and marketplace.
+pub const PLUGIN_PACKAGE_SIGNING_DOMAIN_V1: &[u8] = b"PeakActivity:PluginPackageV1\0";
+
+pub fn plugin_package_signing_bytes_v1(
+    package: &SignedPluginPackageV1,
+) -> Result<Vec<u8>, PluginContractErrorV1> {
+    package.validate().map_err(|_| PluginContractErrorV1::InvalidPackage)?;
+    let manifest = serde_json::to_value(&package.manifest)
+        .map_err(|_| PluginContractErrorV1::InvalidPackage)?;
+    let bytes = serde_json::to_vec(&manifest)
+        .map_err(|_| PluginContractErrorV1::InvalidPackage)?;
+    let digest = decode_lower_hex_sha256(&package.module_sha256)?;
+    let length = u32::try_from(bytes.len()).map_err(|_| PluginContractErrorV1::InvalidPackage)?;
+    let mut signed = Vec::with_capacity(PLUGIN_PACKAGE_SIGNING_DOMAIN_V1.len() + 2 + 4 + bytes.len() + 32);
+    signed.extend_from_slice(PLUGIN_PACKAGE_SIGNING_DOMAIN_V1);
+    signed.extend_from_slice(&package.schema_version.to_be_bytes());
+    signed.extend_from_slice(&length.to_be_bytes());
+    signed.extend_from_slice(&bytes);
+    signed.extend_from_slice(&digest);
+    Ok(signed)
+}
+
+fn decode_lower_hex_sha256(value: &str) -> Result<[u8; 32], PluginContractErrorV1> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return Err(PluginContractErrorV1::InvalidPackage);
+    }
+    let mut output = [0; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char).to_digit(16).ok_or(PluginContractErrorV1::InvalidPackage)?;
+        let low = (pair[1] as char).to_digit(16).ok_or(PluginContractErrorV1::InvalidPackage)?;
+        output[index] = ((high << 4) | low) as u8;
+    }
+    Ok(output)
+}
+
+
+/// V1 destructive actions never name vault paths or another plugin's resources.
+pub fn plugin_destructive_target_allowed_v1(intent: &PluginDestructiveIntentV1, network_count: usize) -> bool {
+    match intent.action {
+        PluginDestructiveActionV1::Export | PluginDestructiveActionV1::Delete => intent.resource_id == "plugin_owned_data",
+        PluginDestructiveActionV1::Send => plugin_network_resource_index_v1(&intent.resource_id).is_some_and(|index| index < network_count),
+    }
+}
+
+pub fn plugin_network_resource_index_v1(resource: &str) -> Option<usize> {
+    let index = resource.strip_prefix("network:")?.parse::<usize>().ok()?;
+    (index < PLUGIN_MAX_GRANTS_V1 && resource == format!("network:{index}")).then_some(index)
 }

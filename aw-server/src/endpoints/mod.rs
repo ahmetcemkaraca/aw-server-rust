@@ -67,6 +67,7 @@ mod sync;
 
 pub use util::HttpErrorJson;
 pub use egress::EgressPolicyTrust;
+pub use plugins::PluginTrust;
 
 #[get("/")]
 fn root_index(state: &State<ServerState>) -> Option<(ContentType, Vec<u8>)> {
@@ -158,6 +159,13 @@ pub fn build_rocket_with_policy_trust(
     config: AWConfig,
     egress_policy_trust: EgressPolicyTrust,
 ) -> rocket::Rocket<rocket::Build> {
+    build_rocket_with_plugin_trust(server_state, config, egress_policy_trust, PluginTrust::default())
+}
+
+pub fn build_rocket_with_plugin_trust(
+    server_state: ServerState, config: AWConfig,
+    egress_policy_trust: EgressPolicyTrust, plugin_trust: PluginTrust,
+) -> rocket::Rocket<rocket::Build> {
     info!(
         "Starting aw-server-rust at {}:{}",
         config.address, config.port
@@ -181,6 +189,7 @@ pub fn build_rocket_with_policy_trust(
         .manage(server_state)
         .manage(egress_proxy)
         .manage(egress_policy_trust)
+        .manage(plugin_trust)
         .manage(config)
         .mount("/api/0/session", routes![apikey::refresh])
         .mount("/api/0/capture", routes![capture::get, capture::set])
@@ -293,6 +302,16 @@ pub fn build_rocket_with_policy_trust(
             sync::list_objects,
             sync::delete_object,
             sync::history,
+        ]);
+    }
+
+    #[cfg(all(feature = "plugin-runtime", any(feature = "encryption", feature = "encryption-vendored")))]
+    {
+        use plugins::lifecycle;
+        rocket = rocket.mount("/api/0/plugins", routes![
+            lifecycle::installed, lifecycle::install, lifecycle::update, lifecycle::consent,
+            lifecycle::revoke, lifecycle::delete, lifecycle::invoke, lifecycle::approve_writes,
+            lifecycle::history,
         ]);
     }
 

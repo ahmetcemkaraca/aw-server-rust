@@ -52,7 +52,10 @@ class PluginBoundaryTest(unittest.TestCase):
     def test_plugin_execution_is_hard_gated_without_a_sandbox_runtime(self):
         route = (ROOT / 'aw-server/src/endpoints/plugins.rs').read_text()
         endpoints = (ROOT / 'aw-server/src/endpoints/mod.rs').read_text()
-        self.assertIn('runtime_available: false', route)
+        self.assertIn('runtime_available: trust.ready()', route)
+        self.assertIn('PluginTrust::default()', endpoints)
+        self.assertIn('lifecycle::approve_writes', endpoints)
+        self.assertIn('independent sandbox review are unavailable', route)
         self.assertIn('marketplace_available: false', route)
         self.assertIn('routes![plugins::status]', endpoints)
         self.assertNotIn('plugin_host', endpoints)
@@ -61,8 +64,7 @@ class PluginBoundaryTest(unittest.TestCase):
         view = (webui / 'src/views/settings/PluginSettings.vue').read_text()
         settings = (webui / 'src/views/settings/Settings.vue').read_text()
         route_config = (webui / 'src/route.js').read_text()
-        self.assertIn('No plugin module can be installed or executed', view)
-        self.assertIn('Plugin approval and install/update/revoke/delete lifecycle integration', view)
+        self.assertIn('PluginSettings', settings)
         self.assertIn("id: 'plugins'", settings)
         self.assertIn('plugins|developer', route_config)
 

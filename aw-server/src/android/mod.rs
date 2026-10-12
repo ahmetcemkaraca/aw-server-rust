@@ -30,8 +30,8 @@ pub extern "C" fn rust_greeting(to: *const c_char) -> *mut c_char {
 pub mod android {
     extern crate jni;
 
-    use self::jni::objects::{JByteArray, JClass, JString};
-    use self::jni::sys::{jboolean, jdouble, jint, jstring, JNI_FALSE, JNI_TRUE};
+    use self::jni::objects::{JClass, JString};
+    use self::jni::sys::{jboolean, jbyteArray, jdouble, jint, jstring, JNI_FALSE, JNI_TRUE};
     use self::jni::JNIEnv;
     use super::*;
 
@@ -210,7 +210,7 @@ pub mod android {
     pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_setVaultKey(
         env: JNIEnv,
         _: JClass,
-        java_key: JByteArray,
+        java_key: jbyteArray,
     ) -> jboolean {
         let mut bytes = match env.convert_byte_array(java_key) {
             Ok(bytes) if bytes.len() == 32 => bytes,
@@ -319,7 +319,7 @@ pub mod android {
     pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_nativeMigrateLegacyVault(
         env: JNIEnv,
         _: JClass,
-        java_key: JByteArray,
+        java_key: jbyteArray,
         accepted: jboolean,
     ) -> jboolean {
         if accepted != JNI_TRUE {

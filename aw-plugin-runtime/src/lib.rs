@@ -9,7 +9,7 @@ use ring::signature::{UnparsedPublicKey, ED25519};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
 
-pub const PLUGIN_PACKAGE_SIGNING_DOMAIN_V1: &[u8] = b"PeakActivity:PluginPackageV1\0";
+pub use aw_models::PLUGIN_PACKAGE_SIGNING_DOMAIN_V1;
 pub const PLUGIN_MAX_MODULE_BYTES_V1: usize = 16 * 1024 * 1024;
 pub const PLUGIN_RUNTIME_MAX_MODULE_BYTES_V1: usize = 16 * 1024 * 1024;
 pub const PLUGIN_RUNTIME_MAX_INPUT_BYTES_V1: usize = 1024 * 1024;
@@ -44,20 +44,8 @@ impl VerifiedPluginPackageV1 {
 pub fn plugin_package_signing_bytes_v1(
     package: &SignedPluginPackageV1,
 ) -> Result<Vec<u8>, PluginPackageVerificationErrorV1> {
-    package.validate().map_err(|_| PluginPackageVerificationErrorV1::InvalidPackage)?;
-    let manifest = serde_json::to_value(&package.manifest)
-        .map_err(|_| PluginPackageVerificationErrorV1::InvalidPackage)?;
-    let bytes = serde_json::to_vec(&manifest)
-        .map_err(|_| PluginPackageVerificationErrorV1::InvalidPackage)?;
-    let digest = decode_lower_hex_sha256(&package.module_sha256)?;
-    let length = u32::try_from(bytes.len()).map_err(|_| PluginPackageVerificationErrorV1::InvalidPackage)?;
-    let mut signed = Vec::with_capacity(PLUGIN_PACKAGE_SIGNING_DOMAIN_V1.len() + 2 + 4 + bytes.len() + 32);
-    signed.extend_from_slice(PLUGIN_PACKAGE_SIGNING_DOMAIN_V1);
-    signed.extend_from_slice(&package.schema_version.to_be_bytes());
-    signed.extend_from_slice(&length.to_be_bytes());
-    signed.extend_from_slice(&bytes);
-    signed.extend_from_slice(&digest);
-    Ok(signed)
+    aw_models::plugin_package_signing_bytes_v1(package)
+        .map_err(|_| PluginPackageVerificationErrorV1::InvalidPackage)
 }
 
 pub fn verify_plugin_package_v1(
@@ -94,18 +82,6 @@ pub fn verify_plugin_package_v1(
     })
 }
 
-fn decode_lower_hex_sha256(value: &str) -> Result<[u8; 32], PluginPackageVerificationErrorV1> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
-        return Err(PluginPackageVerificationErrorV1::InvalidPackage);
-    }
-    let mut output = [0; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = (pair[0] as char).to_digit(16).ok_or(PluginPackageVerificationErrorV1::InvalidPackage)?;
-        let low = (pair[1] as char).to_digit(16).ok_or(PluginPackageVerificationErrorV1::InvalidPackage)?;
-        output[index] = ((high << 4) | low) as u8;
-    }
-    Ok(output)
-}
 
 fn to_lower_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -145,6 +121,7 @@ impl PluginRuntimeV1 {
     pub fn new() -> Result<Self, PluginRuntimeErrorV1> {
         let mut config = Config::new();
         config.consume_fuel(true);
+        config.epoch_interruption(true);
         // The Wasmtime dependency omits its `threads` feature entirely.
         let engine = Engine::new(&config).map_err(|_| PluginRuntimeErrorV1::InvalidModule)?;
         Ok(Self { engine })
@@ -183,6 +160,51 @@ impl PluginRuntimeV1 {
         input: &ValidatedPluginInputV1,
         active_ai_profile_id: Option<&str>,
     ) -> Result<ValidatedPluginOutputV1, PluginRuntimeErrorV1> {
+        self.invoke_budget(plugin, input, active_ai_profile_id, PLUGIN_RUNTIME_MAX_MEMORY_BYTES_V1, 30_000)
+    }
+
+    pub fn invoke_background(
+        &self, plugin: &CompiledPluginV1, input: &ValidatedPluginInputV1,
+        active_ai_profile_id: Option<&str>,
+    ) -> Result<ValidatedPluginOutputV1, PluginRuntimeErrorV1> {
+        let budget = plugin.manifest.capabilities.background.as_ref().ok_or(PluginRuntimeErrorV1::CapabilityDenied)?;
+        self.invoke_budget(plugin, input, active_ai_profile_id,
+            (budget.maximum_memory_bytes as usize).min(PLUGIN_RUNTIME_MAX_MEMORY_BYTES_V1), budget.maximum_runtime_ms)
+    }
+
+    fn invoke_budget(
+        &self, plugin: &CompiledPluginV1, input: &ValidatedPluginInputV1,
+        active_ai_profile_id: Option<&str>, memory_bytes: usize, runtime_ms: u32,
+    ) -> Result<ValidatedPluginOutputV1, PluginRuntimeErrorV1> {
+        let stop = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+        let engine = self.engine.clone();
+        std::thread::scope(|scope| {
+            let stop_ref = &stop;
+            scope.spawn(move || {
+                let guard = stop_ref.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (guard, timeout) = stop_ref.1.wait_timeout_while(guard,
+                    std::time::Duration::from_millis(u64::from(runtime_ms)), |done| !*done)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut guard = guard;
+                if timeout.timed_out() {
+                    while !*guard {
+                        engine.increment_epoch();
+                        guard = stop_ref.1.wait_timeout(guard, std::time::Duration::from_millis(1))
+                            .unwrap_or_else(std::sync::PoisonError::into_inner).0;
+                    }
+                }
+            });
+            let result = self.invoke_inner(plugin, input, active_ai_profile_id, memory_bytes);
+            *stop.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            stop.1.notify_one();
+            result
+        })
+    }
+
+    fn invoke_inner(
+        &self, plugin: &CompiledPluginV1, input: &ValidatedPluginInputV1,
+        active_ai_profile_id: Option<&str>, memory_bytes: usize,
+    ) -> Result<ValidatedPluginOutputV1, PluginRuntimeErrorV1> {
         if !input.is_for_manifest(&plugin.manifest) {
             return Err(PluginRuntimeErrorV1::CapabilityDenied);
         }
@@ -194,7 +216,7 @@ impl PluginRuntimeV1 {
             return Err(PluginRuntimeErrorV1::InvalidInput);
         }
         let limits = StoreLimitsBuilder::new()
-            .memory_size(PLUGIN_RUNTIME_MAX_MEMORY_BYTES_V1)
+            .memory_size(memory_bytes)
             .table_elements(1024)
             .instances(1)
             .tables(1)
@@ -203,6 +225,7 @@ impl PluginRuntimeV1 {
             .build();
         let mut store = Store::new(&self.engine, StoreState { limits });
         store.limiter(|state| &mut state.limits);
+        store.set_epoch_deadline(1);
         store.set_fuel(PLUGIN_RUNTIME_FUEL_V1).map_err(|_| PluginRuntimeErrorV1::ExecutionLimit)?;
         let instance = Instance::new(&mut store, &plugin.module, &[])
             .map_err(|_| PluginRuntimeErrorV1::InvalidModule)?;

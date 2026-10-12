@@ -4,10 +4,10 @@
 //! and destructive intents still require their existing preview/approval path.
 use aw_datastore::{Datastore, DatastoreError};
 use aw_models::{
-    validate_plugin_input_v1, AIUserRequestV1, EgressDecisionV1, EgressRequestV1,
+    validate_plugin_input_v1, AIUserRequestV1, EgressPreviewV1, EgressRequestV1,
     PluginDataClassV1, PluginDestructiveIntentV1, PluginInputRecordV1,
     PluginInvocationInputV1, PluginInvocationOutputV1, PluginManifestV1,
-    PluginNetworkIntentV1, PluginUIOutputV1, PluginWriteIntentV1, PluginContractErrorV1,
+    PluginNetworkIntentV1, PluginStorageIntentV1, PluginUIOutputV1, PluginWriteIntentV1, PluginContractErrorV1,
     ValidatedPluginInputV1, ValidatedPluginOutputV1, PLUGIN_SCHEMA_VERSION_V1,
     PLUGIN_MAX_INVOCATION_RECORDS_V1,
 };
@@ -25,14 +25,7 @@ pub enum PluginHostErrorV1 {
     EgressPolicyUnavailable,
 }
 
-#[derive(Clone, Debug)]
-pub struct PreparedPluginActionsV1 {
-    pub ui: Vec<PluginUIOutputV1>,
-    pub writes: Vec<PluginWriteIntentV1>,
-    pub network_previews: Vec<EgressDecisionV1>,
-    pub ai_requests: Vec<AIUserRequestV1>,
-    pub destructive_confirmations: Vec<PluginDestructiveIntentV1>,
-}
+pub use aw_datastore::plugins::PluginActionInputsV1 as PreparedPluginActionsV1;
 
 pub fn prepare_plugin_input(
     datastore: &Datastore,
@@ -133,11 +126,13 @@ pub fn apply_plugin_output(
 ) -> Result<PluginInvocationOutputV1, PluginHostErrorV1> {
     if !datastore.is_encrypted() { return Err(PluginHostErrorV1::VaultUnavailable); }
     if !output.is_for_manifest(manifest) { return Err(PluginHostErrorV1::InvalidOutput); }
-    datastore.apply_plugin_storage_intents(manifest, &output.as_inner().storage).map_err(map_storage_error)?;
+    if !output.as_inner().storage.is_empty() {
+        datastore.apply_plugin_storage_intents(manifest, &output.as_inner().storage).map_err(map_storage_error)?;
+    }
     Ok(output.into_inner())
 }
 
-/// Store permitted plugin-owned data and prepare all other effects for existing approval flows.
+/// Prepare effects for existing approval flows; the lifecycle transaction persists storage.
 /// This function never sends network requests or performs writes/destructive actions.
 pub fn prepare_plugin_actions(
     datastore: &Datastore,
@@ -149,6 +144,7 @@ pub fn prepare_plugin_actions(
     now: DateTime<Utc>,
     local_offset_seconds: i32,
 ) -> Result<PreparedPluginActionsV1, PluginHostErrorV1> {
+    if !datastore.is_encrypted() { return Err(PluginHostErrorV1::VaultUnavailable); }
     if !output.is_for_manifest(manifest) { return Err(PluginHostErrorV1::InvalidOutput); }
     validate_plugin_egress_grants_v1(manifest, policy)
         .map_err(|_| PluginHostErrorV1::EgressPolicyUnavailable)?;
@@ -173,10 +169,11 @@ pub fn prepare_plugin_actions(
         request.validate().map_err(|_| PluginHostErrorV1::InvalidOutput)?;
         Ok(request)
     }).collect::<Result<Vec<_>, PluginHostErrorV1>>()?;
-    let output = apply_plugin_output(datastore, manifest, output)?;
+    let output = output.into_inner();
     Ok(PreparedPluginActionsV1 {
         ui: output.ui,
         writes: output.writes,
+        storage: output.storage,
         network_previews,
         ai_requests,
         destructive_confirmations: output.destructive,
@@ -190,17 +187,23 @@ fn preview_network_intent(
     intent: &PluginNetworkIntentV1,
     now: DateTime<Utc>,
     local_offset_seconds: i32,
-) -> Result<EgressDecisionV1, PluginHostErrorV1> {
+) -> Result<EgressPreviewV1, PluginHostErrorV1> {
     let purpose = purposes.iter()
         .find(|purpose| purpose.id == intent.purpose_id && purpose.destination_id == intent.destination_id)
         .ok_or(PluginHostErrorV1::EgressPolicyUnavailable)?;
-    Ok(proxy.preview(policy, EgressRequestV1 {
+    let decision = proxy.preview(policy, EgressRequestV1 {
         schema_version: 1,
         destination_id: intent.destination_id.clone(),
         purpose_id: intent.purpose_id.clone(),
         retention_id: purpose.retention_id.clone(),
         payload: intent.payload.clone(),
-    }, now, local_offset_seconds))
+    }, now, local_offset_seconds);
+    Ok(EgressPreviewV1 {
+        schema_version: 1, destination_id: intent.destination_id.clone(),
+        destination_origin: policy.policy().destinations.iter().find(|d| d.id == intent.destination_id).and_then(|d| d.https_origin.clone()),
+        purpose_id: intent.purpose_id.clone(), retention_id: purpose.retention_id.clone(),
+        retention_disclosure: Some(purpose.retention_disclosure.clone()), decision,
+    })
 }
 
 fn map_input_error(_: PluginContractErrorV1) -> PluginHostErrorV1 { PluginHostErrorV1::InvalidInput }
