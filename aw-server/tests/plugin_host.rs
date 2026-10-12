@@ -197,7 +197,7 @@ fn plugin_network_and_ai_intents_return_existing_approval_inputs_without_sending
             aggregate: json!({"project_alias":"p-01","date":"2026-09-01","approved_duration_seconds":3600}),
         }],
         destructive: vec![PluginDestructiveIntentV1 {
-            action: PluginDestructiveActionV1::Export, resource_id: "report-01".into(),
+            action: PluginDestructiveActionV1::Export, resource_id: "plugin_owned_data".into(),
         }],
         ..PluginInvocationOutputV1::default()
     }, Some("profile_01")).unwrap();
@@ -213,7 +213,7 @@ fn plugin_network_and_ai_intents_return_existing_approval_inputs_without_sending
     assert_eq!(actions.ai_requests.len(), 1);
     assert_eq!(actions.destructive_confirmations.len(), 1);
     assert_eq!(actions.ai_requests[0].profile_id, "profile_01");
-    assert!(actions.network_previews[0].sanitized_payload.is_some());
+    assert!(actions.network_previews[0].decision.sanitized_payload.is_some());
     assert_eq!(actions.destructive_confirmations[0].action, PluginDestructiveActionV1::Export);
     assert_eq!(requests.load(Ordering::Relaxed), 0);
 }

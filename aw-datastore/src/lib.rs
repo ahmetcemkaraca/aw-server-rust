@@ -22,6 +22,8 @@ mod legacy_import;
 mod privacy_filter;
 mod worker;
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+pub mod plugins;
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
 pub mod vault;
 
 pub use self::datastore::{DatastoreInstance, EventCorrection};

@@ -72,6 +72,8 @@ pub use self::egress::{
 };
 pub use self::info::Info;
 pub use self::plugin::{
+    plugin_package_signing_bytes_v1, PLUGIN_PACKAGE_SIGNING_DOMAIN_V1,
+    plugin_destructive_target_allowed_v1, plugin_network_resource_index_v1,
     plugin_capability_diff_v1, validate_plugin_input_v1, validate_plugin_output_v1,
     validate_plugin_write_intent_v1, PluginAIIntentV1,
     PluginBackgroundCapabilityV1, PluginCapabilitiesV1, PluginCapabilityDiffV1,

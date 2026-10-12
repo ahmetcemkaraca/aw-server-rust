@@ -67,6 +67,7 @@ openssl-sys = { version = "0.9.82", features = ["vendored"]}
 aw-client-rust = { path = "../aw-client-rust" }
 
 [dev-dependencies]
+wat = "1.0"
 base64 = "0.22"
 zeroize = "1"
 
@@ -83,4 +84,9 @@ required-features = ["encryption"]
 [[test]]
 name = "plugin_host"
 path = "tests/plugin_host.rs"
+required-features = ["encryption", "plugin-runtime"]
+
+[[test]]
+name = "plugin_routes"
+path = "tests/plugin_routes.rs"
 required-features = ["encryption", "plugin-runtime"]
