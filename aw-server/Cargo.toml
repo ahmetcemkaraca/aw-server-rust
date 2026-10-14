@@ -6,7 +6,7 @@ edition = "2021"
 
 [lib]
 name = "aw_server"
-crate-type = ["lib", "cdylib"]
+crate-type = ["lib", "cdylib", "staticlib"]
 path = "src/lib.rs"
 
 [[bin]]
@@ -23,6 +23,7 @@ encryption = ["aw-datastore/encryption", "aw-egress/encryption", "dep:aw-sync-e2
 # Enable SQLCipher encryption with vendored OpenSSL (fully self-contained)
 encryption-vendored = ["aw-datastore/encryption-vendored", "aw-egress/encryption-vendored", "dep:aw-sync-e2ee"]
 plugin-runtime = ["dep:aw-plugin-runtime"]
+companion = ["encryption"]
 
 [dependencies]
 base64 = "0.22"
@@ -47,6 +48,7 @@ aw-datastore = { path = "../aw-datastore", default-features = false }
 aw-egress = { path = "../aw-egress", default-features = false }
 aw-sync-e2ee = { path = "../aw-sync-e2ee", optional = true }
 aw-models = { path = "../aw-models" }
+aw-entitlements = { path = "../aw-entitlements" }
 aw-plugin-runtime = { path = "../aw-plugin-runtime", optional = true, default-features = false }
 aw-transform = { path = "../aw-transform" }
 aw-query = { path = "../aw-query", default-features = false }
@@ -59,14 +61,17 @@ sd-notify = "0.4.2"
 [target.'cfg(all(target_os="linux", target_arch="x86"))'.dependencies]
 jemallocator = "0.5.0"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os="android")'.dependencies]
 jni = { version = "0.20", default-features = false }
-libc = "0.2"
 android_logger = "0.13"
 openssl-sys = { version = "0.9.82", features = ["vendored"]}
 aw-client-rust = { path = "../aw-client-rust" }
 
 [dev-dependencies]
+rusqlite = "0.30"
 wat = "1.0"
 base64 = "0.22"
 zeroize = "1"
@@ -90,3 +95,8 @@ required-features = ["encryption", "plugin-runtime"]
 name = "plugin_routes"
 path = "tests/plugin_routes.rs"
 required-features = ["encryption", "plugin-runtime"]
+
+[[test]]
+name = "companion_bridge"
+path = "tests/companion_bridge.rs"
+required-features = ["companion"]

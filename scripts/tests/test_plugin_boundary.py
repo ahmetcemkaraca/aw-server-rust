@@ -60,7 +60,7 @@ class PluginBoundaryTest(unittest.TestCase):
         self.assertIn('routes![plugins::status]', endpoints)
         self.assertNotIn('plugin_host', endpoints)
         self.assertNotIn('PluginRuntime::execute', route)
-        webui = ROOT.parent / 'aw-webui'
+        webui = ROOT / 'aw-webui'
         view = (webui / 'src/views/settings/PluginSettings.vue').read_text()
         settings = (webui / 'src/views/settings/Settings.vue').read_text()
         route_config = (webui / 'src/route.js').read_text()

@@ -7,8 +7,7 @@ use aw_models::{
     EgressPolicyDiffV1, EgressPolicyV1, EgressPurposeV1, EgressReasonCodeV1,
     EgressReceiptV1, EgressRequestV1, EgressUserPolicyV1,
 };
-#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-use aw_models::SYNC_EGRESS_PURPOSE_V1;
+use aw_models::{FREELANCER_TIMESHEET_EGRESS_PURPOSE_V1, SYNC_EGRESS_PURPOSE_V1};
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
 use aw_sync_e2ee::{decrypt_chunk, unwrap_vault_data_key, AccountRootKeyV1, WrappedVaultDataKeyV1};
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
@@ -138,6 +137,7 @@ impl ApprovedEgress {
 #[derive(Clone)]
 pub struct EgressProxy {
     datastore: Datastore,
+    sync_access: Arc<aw_entitlements::RuntimeFeatureAccessV1>,
     transport: Arc<dyn EgressTransport>,
     previews: Arc<Mutex<HashMap<String, Preview>>>,
     user_policy_previews: Arc<Mutex<HashMap<String, UserPolicyPreview>>>,
@@ -151,6 +151,64 @@ pub struct EgressSendGuard<'a> {
 }
 
 impl EgressProxy {
+    pub fn revoke_approvals(&self)->Result<(),EgressReasonCodeV1> {
+        self.with_policy_update(||self.datastore.clear_egress_approvals())?
+            .map_err(|_|EgressReasonCodeV1::InvalidPolicy)
+    }
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn preview_backup(&self,policy:&VerifiedPolicyV1,scope:crate::BackupScopeV1,destination_id:&str,now:DateTime<Utc>,offset:i32)->Result<crate::BackupEgressPreviewV1,EgressReasonCodeV1> {
+        let _gate=self.send_gate.read().map_err(|_|EgressReasonCodeV1::KillSwitch)?;
+        self.validate_current_policy(policy)?;
+        if self.datastore.egress_kill_switch().unwrap_or(true) {return Err(EgressReasonCodeV1::KillSwitch);}
+        let purpose=policy.policy().purposes.iter().find(|p|p.id==SYNC_EGRESS_PURPOSE_V1 && p.destination_id==destination_id).ok_or(EgressReasonCodeV1::UnknownPurpose)?;
+        let context_id=self.datastore.get_sync_policy_context().map_err(|_|EgressReasonCodeV1::InvalidPolicy)?.context_id;
+        let preview=crate::BackupEgressPreviewV1 {scope:Arc::new(scope),policy:policy.policy().clone(),context_id,
+            destination_id:destination_id.into(),retention_id:purpose.retention_id.clone(),retention_disclosure:purpose.retention_disclosure.clone(),
+            preview_id:random_id().map_err(|_|EgressReasonCodeV1::InvalidPolicy)?,created_at:now,expires_at:now+PREVIEW_LIFETIME};
+        self.validate_backup_preview(policy,&preview,now,offset)?;
+        Ok(preview)
+    }
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn approve_backup(&self,policy:&VerifiedPolicyV1,preview:&crate::BackupEgressPreviewV1,accepted:bool,now:DateTime<Utc>,offset:i32)->Result<crate::ReviewedBackupPermitV1,EgressReasonCodeV1> {
+        if !accepted {return Err(EgressReasonCodeV1::ApprovalRequired);}
+        let _gate=self.send_gate.read().map_err(|_|EgressReasonCodeV1::KillSwitch)?;
+        self.validate_backup_preview(policy,preview,now,offset)?;
+        let secrets=self.datastore.get_or_create_egress_secrets().map_err(|_|EgressReasonCodeV1::InvalidPolicy)?;
+        let tag=payload_tag(secrets.approval_secret(),&preview.scope_bytes()?);
+        let approval_id=self.datastore.create_egress_approval(&preview.destination_id,SYNC_EGRESS_PURPOSE_V1,&preview.retention_id,
+            preview.policy.version,EgressApprovalScopeV1::TimeLimited,tag,Some(preview.expires_at),now).map_err(|_|EgressReasonCodeV1::ApprovalRequired)?;
+        Ok(crate::ReviewedBackupPermitV1 {preview:preview.clone(),approval_id})
+    }
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn send_backup_request(&self,policy:&VerifiedPolicyV1,permit:&crate::ReviewedBackupPermitV1,request:EgressRequestV1,now:DateTime<Utc>,offset:i32)->Result<(EgressReceiptV1,Vec<u8>),EgressReasonCodeV1> {
+        self.send_relay_request(policy,request,now,offset,Some(permit))
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    fn validate_current_policy(&self,policy:&VerifiedPolicyV1)->Result<(),EgressReasonCodeV1> {
+        if policy.custom_endpoint_profile().is_some() {return Err(EgressReasonCodeV1::InvalidPolicy);}
+        let (bundle,user)=self.datastore.get_egress_policy_state().map_err(|_|EgressReasonCodeV1::InvalidPolicy)?.ok_or(EgressReasonCodeV1::InvalidPolicy)?;
+        let current=EgressPolicyV1::from_bundle_and_user(&bundle.bundle,&user).map_err(|_|EgressReasonCodeV1::InvalidPolicy)?;
+        if &current!=policy.policy() {return Err(EgressReasonCodeV1::PolicyChanged);}
+        Ok(())
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    fn validate_backup_preview(&self,policy:&VerifiedPolicyV1,preview:&crate::BackupEgressPreviewV1,now:DateTime<Utc>,offset:i32)->Result<(),EgressReasonCodeV1> {
+        if self.datastore.egress_kill_switch().unwrap_or(true) {return Err(EgressReasonCodeV1::KillSwitch);}
+        self.validate_current_policy(policy)?;
+        if &preview.policy!=policy.policy() {return Err(EgressReasonCodeV1::PolicyChanged);}
+        if now<preview.created_at || now>=preview.expires_at {return Err(EgressReasonCodeV1::ApprovalExpired);}
+        if self.datastore.get_sync_policy_context().map_err(|_|EgressReasonCodeV1::InvalidPolicy)?.context_id!=preview.context_id {return Err(EgressReasonCodeV1::ApprovalExpired);}
+        let secrets=self.datastore.get_or_create_egress_secrets().map_err(|_|EgressReasonCodeV1::InvalidPolicy)?;
+        let payload=serde_json::to_value(preview.scope.sample_request()).map_err(|_|EgressReasonCodeV1::InvalidPayload)?;
+        let request=EgressRequestV1 {schema_version:1,destination_id:preview.destination_id.clone(),purpose_id:SYNC_EGRESS_PURPOSE_V1.into(),retention_id:preview.retention_id.clone(),payload};
+        let evaluation=EvaluationContext {now_utc:now,local_offset_seconds:offset,alias_secret:secrets.alias_secret(),preview_id:&preview.preview_id};
+        let decision=evaluate(&request,policy.policy(),&evaluation);
+        if decision.outcome!=EgressOutcomeV1::Allow {return Err(decision.reason_codes.first().copied().unwrap_or(EgressReasonCodeV1::ApprovalRequired));}
+        if decision.sanitized_payload.as_ref()!=Some(&request.payload) {return Err(EgressReasonCodeV1::PolicyChanged);}
+        Ok(())
+    }
     pub fn new(datastore: Datastore) -> Self {
         Self::with_transport(datastore, ReqwestTransport)
     }
@@ -158,11 +216,32 @@ impl EgressProxy {
     pub fn with_transport<T: EgressTransport + 'static>(datastore: Datastore, transport: T) -> Self {
         Self {
             datastore,
+            sync_access: Arc::default(),
             transport: Arc::new(transport),
             previews: Arc::new(Mutex::new(HashMap::new())),
             user_policy_previews: Arc::new(Mutex::new(HashMap::new())),
             send_gate: Arc::new(RwLock::new(())),
         }
+    }
+
+    /// Only native/release code supplies the separate signed billing proof source.
+    pub fn with_sync_access(mut self, access: Arc<aw_entitlements::RuntimeFeatureAccessV1>) -> Self {
+        self.sync_access = access;
+        self
+    }
+
+    pub fn sync_access(&self) -> Arc<aw_entitlements::RuntimeFeatureAccessV1> {
+        self.sync_access.clone()
+    }
+
+    pub fn require_sync_access(&self, now: DateTime<Utc>) -> Result<(), EgressReasonCodeV1> {
+        let now = u64::try_from(now.timestamp()).map_err(|_| EgressReasonCodeV1::ApprovalRequired)?;
+        self.sync_access.require_sync_access(now).map(|_| ()).map_err(|_| EgressReasonCodeV1::ApprovalRequired)
+    }
+
+    fn with_feature_work<T>(&self, feature_id: &str, now: DateTime<Utc>, action: impl FnOnce() -> Result<T,EgressReasonCodeV1>) -> Result<T,EgressReasonCodeV1> {
+        let now = u64::try_from(now.timestamp()).map_err(|_| EgressReasonCodeV1::ApprovalRequired)?;
+        self.sync_access.with_feature_access(feature_id,now,action).map_err(|_| EgressReasonCodeV1::ApprovalRequired)?
     }
 
     pub fn begin_send(&self) -> Result<EgressSendGuard<'_>, EgressReasonCodeV1> {
@@ -376,6 +455,43 @@ impl EgressProxy {
         // manifest or the exact latest snapshot already stored on this device.
         decrypt_chunk(&key, envelope).map_err(|_| EgressReasonCodeV1::InvalidPayload)?;
         Ok(())
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    fn validate_sync_request(
+        &self,
+        policy: &VerifiedPolicyV1,
+        request: &EgressRequestV1,
+    ) -> Result<aw_models::SyncRelayRequestV1, EgressReasonCodeV1> {
+        let consent = self.datastore.sync_egress_consent()
+            .ok().flatten().ok_or(EgressReasonCodeV1::ApprovalRequired)?;
+        if consent.destination_id != request.destination_id || consent.purpose_id != request.purpose_id {
+            return Err(EgressReasonCodeV1::ApprovalRequired);
+        }
+        let (bundle, user) = self.datastore.get_egress_policy_state()
+            .map_err(|_| EgressReasonCodeV1::InvalidPolicy)?
+            .ok_or(EgressReasonCodeV1::InvalidPolicy)?;
+        let current = EgressPolicyV1::from_bundle_and_user(&bundle.bundle, &user)
+            .map_err(|_| EgressReasonCodeV1::InvalidPolicy)?;
+        if &current != policy.policy() {
+            return Err(EgressReasonCodeV1::PolicyChanged);
+        }
+        let baseline = self.datastore.begin_sync_baseline()
+            .map_err(|_| EgressReasonCodeV1::ApprovalRequired)?;
+        if !baseline.complete { return Err(EgressReasonCodeV1::ApprovalRequired); }
+        if !request.payload.is_object()
+            || request.payload.get("envelope").is_some_and(|value| !value.is_null() && !value.is_object())
+        {
+            return Err(EgressReasonCodeV1::InvalidPayload);
+        }
+        let request: aw_models::SyncRelayRequestV1 = serde_json::from_value(request.payload.clone())
+            .map_err(|_| EgressReasonCodeV1::InvalidPayload)?;
+        request.validate().map_err(|_| EgressReasonCodeV1::InvalidPayload)?;
+        if request.operation==aw_models::SyncRelayOperationV1::DeleteSelectedBackup {return Err(EgressReasonCodeV1::ApprovalRequired);}
+        if let Some(envelope) = &request.envelope {
+            self.validate_sync_envelope(envelope)?;
+        }
+        Ok(request)
     }
 
     pub fn preview(
@@ -694,6 +810,12 @@ impl EgressProxy {
         now_utc: DateTime<Utc>,
         local_offset_seconds: i32,
     ) -> Result<(EgressReceiptV1, Vec<u8>), EgressReasonCodeV1> {
+        self.send_relay_request(policy,request,now_utc,local_offset_seconds,None)
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    fn send_relay_request(&self,policy:&VerifiedPolicyV1,request:EgressRequestV1,now_utc:DateTime<Utc>,local_offset_seconds:i32,backup:Option<&crate::ReviewedBackupPermitV1>)
+        ->Result<(EgressReceiptV1,Vec<u8>),EgressReasonCodeV1> {
         let _gate = self.send_gate.read().map_err(|_| EgressReasonCodeV1::KillSwitch)?;
         if self.datastore.egress_kill_switch().unwrap_or(true) {
             return Err(EgressReasonCodeV1::KillSwitch);
@@ -701,19 +823,21 @@ impl EgressProxy {
         if request.purpose_id != SYNC_EGRESS_PURPOSE_V1 {
             return Err(EgressReasonCodeV1::UnknownPurpose);
         }
-        let consent = self.datastore.sync_egress_consent()
-            .ok().flatten().ok_or(EgressReasonCodeV1::ApprovalRequired)?;
-        if consent.destination_id != request.destination_id || consent.purpose_id != request.purpose_id {
-            return Err(EgressReasonCodeV1::ApprovalRequired);
-        }
-        let baseline = self.datastore.begin_sync_baseline()
-            .map_err(|_| EgressReasonCodeV1::ApprovalRequired)?;
-        if !baseline.complete { return Err(EgressReasonCodeV1::ApprovalRequired); }
+        let relay=if let Some(permit)=backup {
+            self.validate_current_policy(policy)?;
+            if policy.policy()!=&permit.preview.policy || request.destination_id!=permit.preview.destination_id
+                || request.retention_id!=permit.preview.retention_id {return Err(EgressReasonCodeV1::PolicyChanged);}
+            if now_utc<permit.preview.created_at || now_utc>=permit.preview.expires_at {return Err(EgressReasonCodeV1::ApprovalExpired);}
+            if !request.payload.is_object() || request.payload.get("envelope").is_some_and(|v|!v.is_null() && !v.is_object()) {return Err(EgressReasonCodeV1::InvalidPayload);}
+            let relay:aw_models::SyncRelayRequestV1=serde_json::from_value(request.payload.clone()).map_err(|_|EgressReasonCodeV1::InvalidPayload)?;
+            permit.preview.scope.validate_request(&relay)?;relay
+        } else {self.validate_sync_request(policy,&request)?};
         let original_payload = serde_json::to_vec(&request.payload).map_err(|_| EgressReasonCodeV1::InvalidPayload)?;
         if original_payload.len() > MAX_SYNC_PAYLOAD_BYTES {
             return Err(EgressReasonCodeV1::InvalidPayload);
         }
         let secrets = self.datastore.get_or_create_egress_secrets().map_err(|_| EgressReasonCodeV1::InvalidPolicy)?;
+        let backup_tag=backup.map(|permit|permit.preview.scope_bytes().map(|bytes|payload_tag(secrets.approval_secret(),&bytes))).transpose()?;
         let preview_id = random_id().map_err(|_| EgressReasonCodeV1::InvalidPolicy)?;
         let context = EvaluationContext {
             now_utc,
@@ -741,7 +865,15 @@ impl EgressProxy {
         if lease.egress_kill_switch().unwrap_or(true) {
             return Err(EgressReasonCodeV1::KillSwitch);
         }
-        let response = self.transport.request(destination, purpose, &payload)?;
+        if let (Some(permit),Some(tag))=(backup,backup_tag) {
+            if lease.sync_policy_context().map_err(|_|EgressReasonCodeV1::ApprovalExpired)?.context_id!=permit.preview.context_id {return Err(EgressReasonCodeV1::ApprovalExpired);}
+            let scope=lease.consume_egress_approval(&permit.approval_id,&request.destination_id,&request.purpose_id,&request.retention_id,
+                policy.policy().version,tag,now_utc).map_err(|_|EgressReasonCodeV1::ApprovalExpired)?;
+            if scope!=EgressApprovalScopeV1::TimeLimited {return Err(EgressReasonCodeV1::ApprovalRequired);}
+        }
+        let response=if backup.is_some_and(|permit|permit.preview.scope.grants_free_cleanup(&relay)) {
+            self.transport.request(destination,purpose,&payload)?
+        } else {self.with_feature_work("e2ee-sync",now_utc,||self.transport.request(destination,purpose,&payload))?};
         if response.len() > MAX_RESPONSE_BYTES {
             return Err(EgressReasonCodeV1::InvalidPayload);
         }
@@ -752,15 +884,31 @@ impl EgressProxy {
             retention_id: purpose.retention_id.clone(),
             allowed_fields: purpose.allowed_fields.clone(),
             policy_version: policy.policy().version,
-            scope: EgressApprovalScopeV1::DestinationSpecific,
+            scope: if backup.is_some() {EgressApprovalScopeV1::TimeLimited} else {EgressApprovalScopeV1::DestinationSpecific},
             decision: EgressOutcomeV1::Allow,
             created_at: now_utc,
         };
         lease.record_egress_receipt(&receipt).map_err(|_| EgressReasonCodeV1::NetworkUnavailable)?;
+        if let Some(permit)=backup {permit.validate_response(&relay,&response)?;}
         Ok((receipt, response))
     }
 
     fn send_locked(
+        &self,
+        policy: &VerifiedPolicyV1,
+        approved: ApprovedEgress,
+        now_utc: DateTime<Utc>,
+        local_offset_seconds: i32,
+    ) -> Result<EgressReceiptV1, EgressReasonCodeV1> {
+        let feature_id = match approved.purpose_id.as_str() {
+            SYNC_EGRESS_PURPOSE_V1 => "e2ee-sync",
+            FREELANCER_TIMESHEET_EGRESS_PURPOSE_V1 => "freelancer-workspace",
+            _ => return self.send_after_access_check(policy, approved, now_utc, local_offset_seconds),
+        };
+        self.with_feature_work(feature_id, now_utc, || self.send_after_access_check(policy, approved, now_utc, local_offset_seconds))
+    }
+
+    fn send_after_access_check(
         &self,
         policy: &VerifiedPolicyV1,
         approved: ApprovedEgress,
@@ -792,6 +940,20 @@ impl EgressProxy {
             retention_id: approved.retention_id.clone(),
             payload,
         };
+        if approved.purpose_id == FREELANCER_TIMESHEET_EGRESS_PURPOSE_V1 {
+            let timesheet: aw_models::ApprovedTimesheetV1 = serde_json::from_value(request.payload.clone())
+                .map_err(|_| EgressReasonCodeV1::InvalidPayload)?;
+            timesheet.validate().map_err(|_| EgressReasonCodeV1::InvalidPayload)?;
+        }
+        if approved.purpose_id == SYNC_EGRESS_PURPOSE_V1 {
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            if self.validate_sync_request(policy, &request)?.operation == aw_models::SyncRelayOperationV1::DeleteAfterTombstone {
+                // Sync deletion requires the sealed ACK permit from the dedicated sync flow.
+                return Err(EgressReasonCodeV1::ApprovalRequired);
+            }
+            #[cfg(not(any(feature = "encryption", feature = "encryption-vendored")))]
+            return Err(EgressReasonCodeV1::InvalidPayload);
+        }
         let current = evaluate(&request, policy.policy(), &context);
         let current_bytes = current.sanitized_payload.as_ref()
             .and_then(|payload| serde_json::to_vec(payload).ok())
@@ -1343,6 +1505,20 @@ mod tests {
         drop(send_guard);
         finished_rx.recv_timeout(StdDuration::from_secs(1)).unwrap();
         thread.join().unwrap();
+    }
+
+    #[cfg(any(feature = "encryption",feature = "encryption-vendored"))]
+    #[test]
+    fn backup_revoke_approvals_waits_for_an_inflight_send_guard() {
+        let store=Datastore::open_encrypted(":memory:".into(),"a".repeat(64)).unwrap();
+        let proxy=EgressProxy::new(store.clone());let guard=proxy.begin_send().unwrap();
+        let (started_tx,started_rx)=std::sync::mpsc::channel();let (finished_tx,finished_rx)=std::sync::mpsc::channel();
+        let revoker=proxy.clone();let thread=std::thread::spawn(move || {started_tx.send(()).unwrap();revoker.revoke_approvals().unwrap();finished_tx.send(()).unwrap();});
+        started_rx.recv_timeout(StdDuration::from_secs(1)).unwrap();
+        let premature=finished_rx.recv_timeout(StdDuration::from_millis(25));
+        drop(guard);thread.join().unwrap();
+        assert!(premature.is_err(),"Revocation completed before the in-flight send guard was released");
+        finished_rx.recv_timeout(StdDuration::from_secs(1)).unwrap();store.close();
     }
 
     #[test]

@@ -8,7 +8,7 @@ use base64::Engine;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::collections::BTreeMap;
 
-const NOW: u64 = 1_900_000_000;
+pub(super) const NOW: u64 = 1_900_000_000;
 
 fn claims() -> EntitlementClaimsV1 {
     EntitlementClaimsV1 {
@@ -24,7 +24,7 @@ fn claims() -> EntitlementClaimsV1 {
     }
 }
 
-fn signed_entitlement(seed: [u8; 32]) -> (SignedEntitlementV1, [u8; 32]) {
+pub(super) fn signed_entitlement(seed: [u8; 32]) -> (SignedEntitlementV1, [u8; 32]) {
     let keypair = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
     let payload = EntitlementSigningPayloadV1 {
         key_id: "billing-key-1".into(),
@@ -35,7 +35,7 @@ fn signed_entitlement(seed: [u8; 32]) -> (SignedEntitlementV1, [u8; 32]) {
     (SignedEntitlementV1 { payload, signature }, public_key)
 }
 
-fn signed_revocations(
+pub(super) fn signed_revocations(
     seed: [u8; 32],
     sequence: u64,
     revoked_entitlement_ids: Vec<String>,

@@ -382,3 +382,301 @@ fn test_tag() {
     let tags = event.data.get("$tags").unwrap();
     assert_eq!(tags, &serde_json::json!(vec!["test", "test-2"]));
 }
+
+pub enum ControlledRuleV1 {
+    None,
+    Regex {
+        pattern: String,
+        select_keys: Option<Vec<String>>,
+    },
+}
+impl ControlledRuleV1 {
+    pub fn regex(
+        pattern: String,
+        ignore_case: bool,
+        select_keys: Option<Vec<String>>,
+        control: &aw_models::QueryControl,
+    ) -> Result<Self, aw_models::ReportExecutionErrorV1> {
+        use aw_models::{QueryLimits, ReportExecutionErrorV1 as Error};
+        control.checkpoint()?;
+        if pattern.len() > QueryLimits::MANAGED.max_regex_bytes {
+            return Err(Error::ByteLimit);
+        }
+        if select_keys.as_ref().is_some_and(Vec::is_empty) {
+            return Err(Error::StaleConfiguration);
+        }
+        let pattern = if ignore_case {
+            control.charge_bytes((pattern.len() + 4) as u64)?;
+            format!("(?i){pattern}")
+        } else {
+            pattern
+        };
+        Ok(Self::Regex {
+            pattern,
+            select_keys,
+        })
+    }
+}
+// This opaque compiler allowance is logical admission, not measured third-party heap.
+const DECLARED_REGEX_COMPILER_BYTES: u64 = 64 * 1024;
+#[derive(Default)]
+pub struct ControlledRegexCacheV1 {
+    cache: Option<LruCache<String, Regex>>,
+}
+fn report_regex_error(error: fancy_regex::Error) -> aw_models::ReportExecutionErrorV1 {
+    use aw_models::ReportExecutionErrorV1 as Reason;
+    use fancy_regex::{CompileError, Error, RuntimeError};
+    match error {
+        Error::RuntimeError(RuntimeError::BacktrackLimitExceeded | RuntimeError::StackOverflow) => {
+            Reason::FuelLimit
+        }
+        Error::CompileError(error) => match error.as_ref() {
+            CompileError::InnerError(inner) if inner.size_limit().is_some() => Reason::ByteLimit,
+            _ => Reason::StaleConfiguration,
+        },
+        _ => Reason::StaleConfiguration,
+    }
+}
+impl ControlledRegexCacheV1 {
+    pub fn matches(
+        &mut self,
+        rule: &ControlledRuleV1,
+        event: &Event,
+        control: &aw_models::QueryControl,
+    ) -> Result<bool, aw_models::ReportExecutionErrorV1> {
+        use aw_models::{QueryLimits, ReportExecutionErrorV1 as Error};
+        control.charge_fuel(1)?;
+        let ControlledRuleV1::Regex {
+            pattern,
+            select_keys,
+        } = rule
+        else {
+            return Ok(false);
+        };
+        if self
+            .cache
+            .as_ref()
+            .is_none_or(|cache| !cache.contains(pattern.as_str()))
+        {
+            if self.cache.is_none() {
+                control.charge_values(QueryLimits::MANAGED.regex_cache_entries as u64)?;
+                control.charge_bytes(
+                    (QueryLimits::MANAGED.regex_cache_entries
+                        * (std::mem::size_of::<(String, Regex)>()
+                            + 3 * std::mem::size_of::<usize>())) as u64,
+                )?;
+            }
+            control.charge_values(1)?;
+            control.charge_bytes(
+                DECLARED_REGEX_COMPILER_BYTES
+                    + (2 * pattern.len() + std::mem::size_of::<(String, Regex)>()) as u64,
+            )?;
+            control.charge_fuel(pattern.len() as u64 + 1)?;
+            let regex = fancy_regex::RegexBuilder::new(pattern)
+                .backtrack_limit(QueryLimits::MANAGED.max_regex_backtracks)
+                .delegate_size_limit(DECLARED_REGEX_COMPILER_BYTES as usize)
+                .build()
+                .map_err(report_regex_error)?;
+            control.checkpoint()?;
+            self.cache
+                .get_or_insert_with(|| {
+                    LruCache::new(
+                        NonZeroUsize::new(QueryLimits::MANAGED.regex_cache_entries).unwrap(),
+                    )
+                })
+                .put(pattern.clone(), regex);
+        }
+        let regex = self
+            .cache
+            .as_mut()
+            .and_then(|cache| cache.get(pattern.as_str()))
+            .ok_or(Error::InternalError)?;
+        let matching = |value: &serde_json::Value| -> Result<bool, Error> {
+            control.charge_fuel(1)?;
+            let Some(text) = value.as_str() else {
+                return Ok(false);
+            };
+            let result = regex.is_match(text).map_err(report_regex_error)?;
+            control.checkpoint()?;
+            Ok(result)
+        };
+        match select_keys {
+            Some(keys) => {
+                for key in keys {
+                    control.charge_fuel(1)?;
+                    if let Some(value) = event.data.get(key) {
+                        if matching(value)? {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            None => {
+                for value in event.data.values() {
+                    if matching(value)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        control.checkpoint()?;
+        Ok(false)
+    }
+    pub fn len(&self) -> usize {
+        self.cache.as_ref().map_or(0, LruCache::len)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+fn report_category_path(
+    path: &[String],
+    control: &aw_models::QueryControl,
+) -> Result<(), aw_models::ReportExecutionErrorV1> {
+    if path.len() > 8 || !path.iter().all(|s| aw_models::valid_report_label(s, 128)) {
+        return Err(aw_models::ReportExecutionErrorV1::StaleConfiguration);
+    }
+    control.charge_values(path.len() as u64 + 1)?;
+    control.charge_bytes(std::mem::size_of::<Vec<String>>() as u64)?;
+    for segment in path {
+        control.charge_fuel(1)?;
+        control.charge_bytes((segment.len() + std::mem::size_of::<String>()) as u64)?;
+    }
+    Ok(())
+}
+pub fn explain_category_controlled(
+    event: &Event,
+    rules: &[(Vec<String>, ControlledRuleV1)],
+    cache: &mut ControlledRegexCacheV1,
+    control: &aw_models::QueryControl,
+) -> Result<CategoryDecisionV1, aw_models::ReportExecutionErrorV1> {
+    control.checkpoint()?;
+    let mut matches = Vec::new();
+    let mut selected = None;
+    let mut selected_depth = 1;
+    for (index, (path, rule)) in rules.iter().enumerate() {
+        control.charge_fuel(1)?;
+        if !cache.matches(rule, event, control)? {
+            continue;
+        }
+        report_category_path(path, control)?;
+        control.charge_bytes(std::mem::size_of::<CategoryRuleMatchV1>() as u64)?;
+        matches.push(CategoryRuleMatchV1 {
+            rule_index: index,
+            category_path: path.clone(),
+        });
+        if path.len() >= selected_depth {
+            report_category_path(path, control)?;
+            selected_depth = path.len();
+            selected = Some((index, path.clone()));
+        }
+    }
+    control.charge_values(1)?;
+    control.charge_bytes(std::mem::size_of::<CategoryDecisionV1>() as u64)?;
+    let (selected_rule_index, selected_category) = match selected {
+        Some((i, p)) => (Some(i), Some(p)),
+        None => (None, None),
+    };
+    Ok(CategoryDecisionV1 {
+        schema_version: 1,
+        method_id: "category-rule-match",
+        method_version: 1,
+        outcome: if selected_category.is_some() {
+            CategoryDecisionOutcomeV1::Matched
+        } else {
+            CategoryDecisionOutcomeV1::CouldNotDetermine
+        },
+        matched_rules: matches,
+        selected_rule_index,
+        selected_category,
+    })
+}
+pub fn categorize_with_trace_controlled(
+    events: Vec<Event>,
+    rules: &[(Vec<String>, ControlledRuleV1)],
+    cache: &mut ControlledRegexCacheV1,
+    control: &aw_models::QueryControl,
+) -> Result<Vec<(Event, CategoryDecisionV1)>, aw_models::ReportExecutionErrorV1> {
+    let mut output = Vec::new();
+    control.checkpoint()?;
+    for mut event in events {
+        control.charge_fuel(1)?;
+        let decision = explain_category_controlled(&event, rules, cache, control)?;
+        let category = match &decision.selected_category {
+            Some(path) => {
+                report_category_path(path, control)?;
+                path.clone()
+            }
+            None => {
+                control.charge_values(2)?;
+                control.charge_bytes(
+                    ("Uncategorized".len()
+                        + std::mem::size_of::<String>()
+                        + std::mem::size_of::<Vec<String>>()) as u64,
+                )?;
+                vec!["Uncategorized".into()]
+            }
+        };
+        control.charge_values(category.len() as u64 + 1)?;
+        control.charge_bytes(
+            ("$category".len()
+                + std::mem::size_of::<(String, serde_json::Value)>()
+                + category.len() * std::mem::size_of::<serde_json::Value>()) as u64,
+        )?;
+        event.data.insert(
+            "$category".into(),
+            serde_json::Value::Array(
+                category
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+        crate::report_merged_slot(output.len(), control)?;
+        control.charge_bytes(std::mem::size_of::<CategoryDecisionV1>() as u64)?;
+        output.push((event, decision));
+    }
+    control.checkpoint()?;
+    Ok(output)
+}
+pub fn categorize_controlled(
+    events: Vec<Event>,
+    rules: &[(Vec<String>, ControlledRuleV1)],
+    cache: &mut ControlledRegexCacheV1,
+    control: &aw_models::QueryControl,
+) -> Result<Vec<Event>, aw_models::ReportExecutionErrorV1> {
+    let traced = categorize_with_trace_controlled(events, rules, cache, control)?;
+    let mut output = Vec::new();
+    for (event, _) in traced {
+        control.charge_fuel(1)?;
+        crate::report_event_slot(control)?;
+        output.push(event);
+    }
+    Ok(output)
+}
+pub fn category_trace_value_controlled(
+    trace: &CategoryDecisionV1,
+    control: &aw_models::QueryControl,
+) -> Result<serde_json::Value, aw_models::ReportExecutionErrorV1> {
+    control.charge_values(7)?;
+    control.charge_bytes(
+        (std::mem::size_of::<serde_json::Value>()
+            + 7 * std::mem::size_of::<(String, serde_json::Value)>()
+            + 200) as u64,
+    )?;
+    for matched in &trace.matched_rules {
+        report_category_path(&matched.category_path, control)?;
+        control.charge_values(matched.category_path.len() as u64 + 4)?;
+        control.charge_bytes(
+            (4 * std::mem::size_of::<serde_json::Value>()
+                + matched.category_path.len() * std::mem::size_of::<serde_json::Value>()
+                + 40) as u64,
+        )?;
+    }
+    if let Some(path) = &trace.selected_category {
+        report_category_path(path, control)?;
+        control.charge_values(path.len() as u64 + 1)?;
+        control.charge_bytes((path.len() * std::mem::size_of::<serde_json::Value>()) as u64)?;
+    }
+    serde_json::to_value(trace).map_err(|_| aw_models::ReportExecutionErrorV1::InternalError)
+}

@@ -27,11 +27,11 @@ pub fn cors(config: &AWConfig) -> rocket_cors::Cors {
     if config.auth.sessions.is_some() { allowed_regex_origins.clear(); }
 
     let allowed_origins = AllowedOrigins::some(&allowed_exact_origins, &allowed_regex_origins);
-    let allowed_methods = vec![Method::Get, Method::Post, Method::Delete]
+    let allowed_methods = vec![Method::Get, Method::Post, Method::Put, Method::Delete]
         .into_iter()
         .map(From::from)
         .collect();
-    let allowed_headers = AllowedHeaders::some(&["Authorization", "Content-Type"]);
+    let allowed_headers = AllowedHeaders::some(&["Authorization", "Content-Type", "X-PeakActivity-Report-Capability"]);
 
     // You can also deserialize this
     rocket_cors::CorsOptions {

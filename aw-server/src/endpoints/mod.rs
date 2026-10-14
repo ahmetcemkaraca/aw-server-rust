@@ -1,3 +1,6 @@
+pub(crate) mod reports;
+#[cfg(any(feature="encryption",feature="encryption-vendored"))]
+mod backups;
 use rust_embed::RustEmbed;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -58,6 +61,7 @@ mod cors;
 mod export;
 mod freelancer;
 mod egress;
+mod entitlements;
 mod hostcheck;
 mod import;
 mod query;
@@ -67,7 +71,15 @@ mod sync;
 
 pub use util::HttpErrorJson;
 pub use egress::EgressPolicyTrust;
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+pub use egress::{preview_sync_policy, choose_sync_policy, SyncPolicyReviewV1, SyncPolicyFirewallReviewV1};
+#[cfg(feature = "companion")]
+pub(crate) use egress::{active_policy, local_egress_status, preview_local_policy, accept_local_policy};
+#[cfg(feature = "companion")]
+pub(crate) use sync::{local_sync_status, set_local_sync_enabled, run_local_sync, SyncEgressControlRequest};
 pub use plugins::PluginTrust;
+#[cfg(all(feature = "plugin-runtime", any(feature = "encryption", feature = "encryption-vendored")))]
+pub use plugins::lifecycle::run_background as run_plugin_background;
 
 #[get("/")]
 fn root_index(state: &State<ServerState>) -> Option<(ContentType, Vec<u8>)> {
@@ -166,6 +178,15 @@ pub fn build_rocket_with_plugin_trust(
     server_state: ServerState, config: AWConfig,
     egress_policy_trust: EgressPolicyTrust, plugin_trust: PluginTrust,
 ) -> rocket::Rocket<rocket::Build> {
+    build_rocket_inner(server_state,config,egress_policy_trust,plugin_trust,None)
+}
+
+pub fn build_rocket_with_egress_transport<T:aw_egress::EgressTransport+'static>(server_state:ServerState,config:AWConfig,trust:EgressPolicyTrust,transport:T)->rocket::Rocket<rocket::Build> {
+    let proxy=aw_egress::EgressProxy::with_transport(server_state.datastore.clone(),transport);
+    build_rocket_inner(server_state,config,trust,PluginTrust::default(),Some(proxy))
+}
+
+fn build_rocket_inner(server_state:ServerState,config:AWConfig,egress_policy_trust:EgressPolicyTrust,plugin_trust:PluginTrust,injected_proxy:Option<aw_egress::EgressProxy>)->rocket::Rocket<rocket::Build> {
     info!(
         "Starting aw-server-rust at {}:{}",
         config.address, config.port
@@ -179,14 +200,18 @@ pub fn build_rocket_with_plugin_trust(
     let hostcheck = hostcheck::HostCheck::new(&config);
     let apikey = apikey::ApiKeyCheck::new(&config);
     let custom_static = config.custom_static.clone();
-    let egress_proxy = aw_egress::EgressProxy::new(server_state.datastore.clone());
+    let egress_proxy = injected_proxy.unwrap_or_else(||aw_egress::EgressProxy::new(server_state.datastore.clone()))
+        .with_sync_access(config.feature_access.clone());
 
+    let reports=crate::reports::ReportCoordinatorV1::new(server_state.datastore.clone(),config.feature_access.clone());
     let mut rocket = rocket::custom(config.to_rocket_config())
+        .attach(reports::NoStore)
         .attach(cors.clone())
         .attach(hostcheck)
         .attach(apikey)
         .manage(cors)
         .manage(server_state)
+        .manage(reports)
         .manage(egress_proxy)
         .manage(egress_policy_trust)
         .manage(plugin_trust)
@@ -211,6 +236,7 @@ pub fn build_rocket_with_plugin_trust(
             ],
         )
         .mount("/api/0/info", routes![server_info])
+        .mount("/api/0/reports",routes![reports::library,reports::update,reports::export,reports::preview,reports::commit,reports::start,reports::read,reports::cancel,reports::release])
         .mount(
             "/api/0/buckets",
             routes![
@@ -292,6 +318,8 @@ pub fn build_rocket_with_plugin_trust(
 
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
     if sync_routes_enabled {
+        rocket=rocket.manage(crate::backup::BackupWorkflowV1::new()).mount("/api/0/sync/backups",routes![backups::preview,backups::approve,backups::run]);
+        rocket = rocket.mount("/api/0/entitlements", routes![entitlements::status, entitlements::import]);
         rocket = rocket.mount("/api/0/sync", routes![
             sync::sync_enabled,
             sync::set_sync_enabled,
@@ -302,6 +330,10 @@ pub fn build_rocket_with_plugin_trust(
             sync::list_objects,
             sync::delete_object,
             sync::history,
+            sync::policy_context,
+            sync::list_policies,
+            sync::preview_policy,
+            sync::choose_policy,
         ]);
     }
 
@@ -311,8 +343,8 @@ pub fn build_rocket_with_plugin_trust(
         rocket = rocket.mount("/api/0/plugins", routes![
             lifecycle::installed, lifecycle::install, lifecycle::update, lifecycle::consent,
             lifecycle::revoke, lifecycle::delete, lifecycle::invoke, lifecycle::approve_writes,
-            lifecycle::history,
-        ]);
+            lifecycle::pending, lifecycle::approve_action, lifecycle::history,
+        ]).attach(lifecycle::background_scheduler());
     }
 
     // for each custom static directory, mount it at the given name

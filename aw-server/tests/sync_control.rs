@@ -25,6 +25,30 @@ struct CountingSyncStore {
     fail_put: bool,
 }
 
+#[test]
+fn backup_catalogue_does_not_change_operation_sync_snapshot_exclusion() {
+    let root=std::env::temp_dir().join(format!("peak-backup-operation-check-{}-{}",std::process::id(),SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir(&root).unwrap();
+    let devices=paired_devices(&root);
+    let snapshots:Vec<_>=[&devices.first,&devices.second].into_iter().flat_map(|store|store.load_sync_snapshot().unwrap().unwrap().envelopes).map(|envelope|envelope.object_id).collect();
+    for store in [&devices.first,&devices.second] {
+        finish_baseline(store);
+        store.set_egress_kill_switch(false).unwrap();
+        store.set_sync_enabled(true,Some("test-sync-relay".into()),Some("sync-object-v1".into())).unwrap();
+    }
+    let remote=CountingSyncStore::new(false);
+    devices.first_control.sync_operations(&devices.first,&remote).unwrap();
+    devices.second_control.sync_operations(&devices.second,&remote).unwrap();
+    let objects=remote.envelopes.lock().unwrap();
+    assert!(!objects.is_empty());
+    for envelope in objects.values() {
+        assert!(!snapshots.contains(&envelope.object_id));
+        assert!(aw_sync_e2ee::inspect_snapshot_chunk(&devices.data_key,envelope).is_err());
+        assert!(decrypt_manifest(&devices.data_key,envelope).is_ok());
+    }
+    drop(objects);devices.first.close();devices.second.close();fs::remove_dir_all(root).unwrap();
+}
+
 impl CountingSyncStore {
     fn new(fail_put: bool) -> Self {
         Self { envelopes: Mutex::new(BTreeMap::new()), requests: AtomicUsize::new(0), fail_put }
@@ -237,6 +261,58 @@ fn device_pairing_requires_matching_verification_and_transfers_encrypted_keys() 
 }
 
 #[test]
+fn pairing_recovery_recipient_cannot_install_local_keys_during_pending_pairing() {
+    let root = std::env::temp_dir().join(format!("peak-sync-pair-kit-{}-{}",std::process::id(),SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir(&root).unwrap();
+    let first = Datastore::open_encrypted(root.join("issuer.db").to_string_lossy().into_owned(),"a".repeat(64)).unwrap();
+    let second = Datastore::open_encrypted(root.join("recipient.db").to_string_lossy().into_owned(),"b".repeat(64)).unwrap();
+    let issuer = SyncControl::new(); let recipient = SyncControl::new();
+    issuer.invoke(&first,"create_local_sync_identity",json!({})).unwrap();
+    let identity = recipient.invoke(&second,"create_local_sync_identity",json!({})).unwrap();
+    let invitation = issuer.invoke(&first,"create_sync_pairing",json!({"recipient":identity})).unwrap();
+    let response = recipient.invoke(&second,"respond_sync_pairing",json!({"invitation":invitation})).unwrap();
+    assert!(recipient.invoke(&second,"create_sync_recovery_kit",json!({})).is_err());
+    assert!(second.load_sync_key_material().unwrap().is_none());
+    let display = issuer.invoke(&first,"complete_sync_pairing",json!({"response":response})).unwrap();
+    let code = recipient.invoke(&second,"prepare_sync_pairing",json!({"offer":display["offer"]})).unwrap();
+    let issuer_confirmation = issuer.invoke(&first,"confirm_sync_pairing",json!({"displayedCode":display["verification_code"],"userConfirmed":true})).unwrap();
+    let recipient_confirmation = recipient.invoke(&second,"confirm_sync_pairing",json!({"displayedCode":code,"userConfirmed":true})).unwrap();
+    let transfer = issuer.invoke(&first,"create_sync_key_transfer",json!({"peerConfirmation":recipient_confirmation})).unwrap();
+    recipient.invoke(&second,"accept_sync_key_transfer",json!({"peerConfirmation":issuer_confirmation,"transfer":transfer})).unwrap();
+    let received = second.load_sync_key_material().unwrap().unwrap();
+    assert_eq!(received.vault_id(),first.load_sync_key_material().unwrap().unwrap().vault_id());
+    recipient.invoke(&second,"create_sync_recovery_kit",json!({})).unwrap();
+    recipient.invoke(&second,"confirm_sync_recovery_saved",json!({"userConfirmed":true})).unwrap();
+    assert!(second.sync_recovery_confirmation().unwrap().is_some());
+    first.close(); second.close(); fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pairing_recovery_pending_kit_blocks_new_and_response_pairing_until_cancel_or_save() {
+    let root = std::env::temp_dir().join(format!("peak-sync-kit-pair-{}-{}",std::process::id(),SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir(&root).unwrap();
+    let first = Datastore::open_encrypted(root.join("local.db").to_string_lossy().into_owned(),"c".repeat(64)).unwrap();
+    let second = Datastore::open_encrypted(root.join("peer.db").to_string_lossy().into_owned(),"d".repeat(64)).unwrap();
+    let local = SyncControl::new(); let peer = SyncControl::new();
+    let local_identity = local.invoke(&first,"create_local_sync_identity",json!({})).unwrap();
+    let peer_identity = peer.invoke(&second,"create_local_sync_identity",json!({})).unwrap();
+    let invitation = peer.invoke(&second,"create_sync_pairing",json!({"recipient":local_identity})).unwrap();
+    local.invoke(&first,"create_sync_recovery_kit",json!({})).unwrap();
+    let original = first.load_sync_key_material().unwrap().unwrap();
+    assert!(local.invoke(&first,"create_sync_pairing",json!({"recipient":peer_identity})).is_err());
+    assert!(local.invoke(&first,"respond_sync_pairing",json!({"invitation":invitation})).is_err());
+    local.invoke(&first,"cancel_sync_recovery_kit",json!({})).unwrap();
+    let retained = first.load_sync_key_material().unwrap().unwrap();
+    assert!(original.account_root_key() == retained.account_root_key());
+    local.invoke(&first,"create_sync_pairing",json!({"recipient":peer_identity})).unwrap();
+    local.invoke(&first,"cancel_sync_pairing",json!({})).unwrap();
+    local.invoke(&first,"create_sync_recovery_kit",json!({})).unwrap();
+    local.invoke(&first,"confirm_sync_recovery_saved",json!({"userConfirmed":true})).unwrap();
+    local.invoke(&first,"create_sync_pairing",json!({"recipient":peer_identity})).unwrap();
+    first.close(); second.close(); fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn rotation_builds_a_verified_encrypted_snapshot_before_export() {
     let root = std::env::temp_dir().join(format!(
         "peak-sync-snapshot-{}-{}",
@@ -297,8 +373,9 @@ fn restore_requires_acceptance_and_commits_activity_keys_and_snapshot_together()
     finish_baseline(&source);
     let deleted_event = source.get_events("local-tombstone", None, None, None).unwrap().remove(0);
     source.delete_events_by_id("local-tombstone", vec![deleted_event.id.unwrap()]).unwrap();
-    let source_operations = source.list_sync_operations(source_id, 1, 0, 16).unwrap();
-    assert_eq!(source_operations.len(), 3);
+    let source_operations = source.list_sync_operations(source_id, 1, 0, 64).unwrap();
+    assert_eq!(source_operations.len(), 24);
+    assert_eq!(source_operations.iter().filter(|record|serde_json::from_str::<aw_sync_e2ee::SyncOperationV1>(&record.operation_json).unwrap().kind==aw_models::SyncOperationKindV1::PolicyChange).count(),21);
     let source_tombstone: aw_sync_e2ee::SyncOperationV1 = serde_json::from_str(
         &source_operations.iter().find(|record| {
             serde_json::from_str::<aw_sync_e2ee::SyncOperationV1>(&record.operation_json).unwrap().kind
@@ -339,7 +416,7 @@ fn restore_requires_acceptance_and_commits_activity_keys_and_snapshot_together()
     assert!(target.load_sync_snapshot().unwrap().is_some());
     let restored_identity = target.load_sync_device_identity().unwrap().unwrap();
     assert_ne!(*restored_identity.device_id(), source_id);
-    assert_eq!(target.list_sync_operations(source_id, 1, 0, 16).unwrap(), source_operations);
+    assert_eq!(target.list_sync_operations(source_id, 1, 0, 64).unwrap(), source_operations);
     assert_eq!(target.load_sync_manifest_head(vault_id, 1, source_id).unwrap(), Some(expected_head));
     let expected_signing_key: [u8; 32] = URL_SAFE_NO_PAD.decode(source_identity.public_identity().ed25519_public_key).unwrap().try_into().unwrap();
     assert!(target.list_sync_trusted_devices().unwrap().iter().any(|device| {
@@ -360,6 +437,70 @@ fn restore_requires_acceptance_and_commits_activity_keys_and_snapshot_together()
     source.close();
     target.close();
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recovery_snapshot_exports_portable_active_settings_before_sync_without_runtime_authority() {
+    let source = Datastore::open_encrypted(":memory:".into(), "a".repeat(64)).unwrap();
+    let control = SyncControl::new();
+    source.set_key_value("settings.theme", "\"dark\"").unwrap();
+    source.set_key_value("settings.classes", "null").unwrap();
+    source.set_key_value("settings.active_set_ids", "[]").unwrap();
+    source.set_key_value("settings.showYearly", "false").unwrap();
+    source.set_key_value("settings.rawRetentionDays", "0").unwrap();
+    source.set_key_value("private.local.credentials", "\"secret-test-only\"").unwrap();
+    let kit = control.invoke(&source, "create_sync_recovery_kit", json!({})).unwrap();
+    control.invoke(&source, "confirm_sync_recovery_saved", json!({"userConfirmed":true})).unwrap();
+    control.invoke(&source, "create_current_sync_snapshot", json!({})).unwrap();
+    let snapshot: EncryptedSyncSnapshotV1 = serde_json::from_value(control.invoke(&source,"export_sync_snapshot",json!({})).unwrap()).unwrap();
+    let recovered = open_recovery_kit(&serde_json::from_value(kit["kit"].clone()).unwrap(), kit["recovery_phrase"].as_str().unwrap()).unwrap();
+    let key = unwrap_vault_data_key(&recovered.account_root_key, &recovered.wrapped_vault_key).unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&decrypt_snapshot(&key, &snapshot).unwrap()).unwrap();
+    assert_eq!(payload["sync"]["policy"]["schema_version"], 1);
+    let active = payload["sync"]["policy"]["active_values"].as_array().unwrap();
+    assert_eq!(active.len(), 21);
+    let field = |name| &active.iter().find(|entry|entry["field"]==name).unwrap()["value"];
+    assert_eq!(field("settings.theme"), &json!({"schema_version":1,"present":true,"value":"dark"}));
+    assert_eq!(field("settings.classes"), &json!({"schema_version":1,"present":true,"value":null}));
+    assert_eq!(field("settings.active_set_ids")["value"], json!([]));
+    assert_eq!(field("settings.showYearly")["value"], false);
+    assert_eq!(field("settings.rawRetentionDays")["value"], 0);
+    assert_eq!(field("settings.views"), &json!({"schema_version":1,"present":false,"value":null}));
+    for runtime in ["recording","revision","effective_from"] { assert!(field("capture.minimization")["value"].get(runtime).is_none()); }
+    assert!(!payload["sync"]["policy"].to_string().contains("secret-test-only"));
+    assert_eq!(payload["sync"]["operations"],json!([]));
+    let decoded = aw_server::sync_control::decrypt_recovery_snapshot(&key, &snapshot).unwrap();
+    assert!(decoded.sync.policy.is_some());
+    let target = Datastore::open_encrypted(":memory:".into(), "b".repeat(64)).unwrap();
+    target.enable_capture_policy().unwrap(); target.pause_capture().unwrap();
+    let restore = json!({"kit":kit["kit"],"recoveryPhrase":kit["recovery_phrase"],"snapshot":snapshot});
+    let preview = control.invoke(&target,"preview_sync_recovery_restore",restore.clone()).unwrap();
+    assert_eq!(preview["policy_conflict_count"],5);
+    assert_eq!(preview["policy_continuity_present"],true);
+    let mut restore = restore; restore["userAccepted"] = json!(true);
+    control.invoke(&target,"restore_sync_recovery_kit",restore).unwrap();
+    assert!(target.get_key_value("settings.theme").is_err());
+    assert!(!target.capture_policy().unwrap().recording);
+    let pending = target.list_sync_policy_candidates(None,256).unwrap();
+    assert_eq!(pending.candidates.len(),5);
+    let theme = pending.candidates.iter().find(|candidate|candidate.field=="settings.theme").unwrap();
+    let metadata = serde_json::to_value(theme).unwrap();
+    assert_eq!(metadata["recovery_source"]["snapshot_id"],snapshot.snapshot_id);
+    let review = target.preview_sync_policy_candidate(&theme.candidate_id).unwrap();
+    assert_eq!(review.proposed.value,"dark");
+    target.choose_sync_policy(aw_models::SyncPolicyChoiceRequestV1 {schema_version:1,candidate_id:theme.candidate_id.clone(),expected_review_sha256:review.expected_review_sha256,decision:aw_models::SyncPolicyDecisionV1::AcceptRemote}).unwrap();
+    assert_eq!(target.get_key_value("settings.theme").unwrap(),"\"dark\"");
+    assert!(!target.sync_enabled().unwrap());
+    target.close();
+    let mut legacy = payload.clone();
+    legacy["sync"].as_object_mut().unwrap().remove("policy");
+    let legacy = aw_sync_e2ee::encrypt_snapshot(&key, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert!(aw_server::sync_control::decrypt_recovery_snapshot(&key, &legacy).unwrap().sync.policy.is_none());
+    let mut malformed = payload;
+    malformed["sync"]["policy"]["active_values"][0]["field"] = json!("sync.enabled");
+    let malformed = aw_sync_e2ee::encrypt_snapshot(&key, &serde_json::to_vec(&malformed).unwrap()).unwrap();
+    assert!(aw_server::sync_control::decrypt_recovery_snapshot(&key, &malformed).is_err());
+    source.close();
 }
 
 #[test]
@@ -400,8 +541,11 @@ fn pre_sync_snapshot_preserves_event_identity_without_creating_operations() {
     assert_ne!(restored_id, source_id);
     assert!(target.list_sync_operations(restored_id, 1, 0, 8).unwrap().is_empty());
     finish_baseline(&target);
+    let operations = target.list_sync_operations(restored_id, 1, 0, 64).unwrap();
+    assert_eq!(operations.len(),22);
+    assert_eq!(operations.iter().filter(|record|serde_json::from_str::<aw_sync_e2ee::SyncOperationV1>(&record.operation_json).unwrap().kind==aw_models::SyncOperationKindV1::PolicyChange).count(),21);
     let operation: aw_sync_e2ee::SyncOperationV1 = serde_json::from_str(
-        &target.list_sync_operations(restored_id, 1, 0, 8).unwrap()[0].operation_json,
+        &operations.iter().find(|record|serde_json::from_str::<aw_sync_e2ee::SyncOperationV1>(&record.operation_json).unwrap().kind==aw_models::SyncOperationKindV1::Upsert).unwrap().operation_json,
     ).unwrap();
     assert_eq!(operation.device_id, URL_SAFE_NO_PAD.encode(restored_id));
     assert_eq!(operation.origin_device_id, URL_SAFE_NO_PAD.encode(source_id));
@@ -456,11 +600,15 @@ fn rotated_recovery_keeps_counters_but_starts_a_fresh_epoch_stream() {
     let stale_manifest = SyncManifestV1::new_signed(&source_identity, vault_id, 1, 1, [0; 32], Vec::new()).unwrap();
     assert!(target.apply_sync_operations(aw_datastore::SyncApplyBatchV1 { manifest: stale_manifest }).is_err());
 
+    let counter_floor=target.export_sync_recovery_state(2).unwrap().counters.iter().map(|counter|counter.last_counter).max().unwrap();
     finish_baseline(&target);
-    let operations = target.list_sync_operations(restored_id, 2, 0, 8).unwrap();
-    assert_eq!(operations.len(), 1);
-    assert_eq!(operations[0].counter, 6);
-    let operation: aw_sync_e2ee::SyncOperationV1 = serde_json::from_str(&operations[0].operation_json).unwrap();
+    let operations = target.list_sync_operations(restored_id, 2, 0, 64).unwrap();
+    assert_eq!(operations.len(), 22);
+    assert_eq!(operations[0].counter,counter_floor+1);
+    assert_eq!(operations.iter().filter(|record|serde_json::from_str::<aw_sync_e2ee::SyncOperationV1>(&record.operation_json).unwrap().kind==aw_models::SyncOperationKindV1::PolicyChange).count(),21);
+    let event=operations.iter().find(|record|serde_json::from_str::<aw_sync_e2ee::SyncOperationV1>(&record.operation_json).unwrap().kind==aw_models::SyncOperationKindV1::Upsert).unwrap();
+    assert_eq!(event.counter,counter_floor+22);
+    let operation: aw_sync_e2ee::SyncOperationV1 = serde_json::from_str(&event.operation_json).unwrap();
     assert_eq!(operation.origin_device_id, URL_SAFE_NO_PAD.encode(source_id));
 
     source.close();
@@ -861,4 +1009,19 @@ fn relay_failure_keeps_local_operations_and_signed_manifest_in_the_outbox() {
     devices.first.close();
     devices.second.close();
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn backup_forget_large_paired_cycle_uses_bounded_signed_manifests_without_transfer_when_disabled() {
+    let root=std::env::temp_dir().join(format!("peak-forget-paired-{}-{}",std::process::id(),SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));fs::create_dir(&root).unwrap();let devices=paired_devices(&root);finish_baseline(&devices.first);finish_baseline(&devices.second);
+    let old=devices.first.load_sync_snapshot().unwrap().unwrap();let old=EncryptedSyncSnapshotV1{schema_version:1,snapshot_id:URL_SAFE_NO_PAD.encode(old.snapshot_id),envelopes:old.envelopes};
+    devices.first_control.invoke(&devices.first,"create_current_sync_snapshot",json!({})).unwrap();let proof=aw_sync_e2ee::SnapshotDeletionProofV1::authenticate(&devices.data_key,&old).unwrap();let selected=proof.fact().clone();devices.first.delete_sync_backup(devices.first.get_sync_policy_context().unwrap().context_id,proof,"2026-10-14T12:00:00Z".into()).unwrap();
+    // Large metadata fixture exercises signed admission; it grants no physical-object deletion proof.
+    let artifact=aw_sync_e2ee::encrypt_snapshot(&devices.data_key,b"large metadata fixture").unwrap();let mut large=aw_sync_e2ee::SnapshotDeletionProofV1::authenticate(&devices.data_key,&artifact).unwrap().fact().clone();large.objects=(0..12000u128).map(|n|aw_models::SnapshotDeletionObjectV1{object_id:URL_SAFE_NO_PAD.encode((n+100).to_be_bytes()),envelope_sha256:"b".repeat(64)}).collect();devices.first.merge_sync_backup_deletions(devices.first.get_sync_policy_context().unwrap().context_id,vec![large.clone()],"2026-10-14T12:01:00Z".into()).unwrap();
+    let remote=CountingSyncStore::new(false);assert!(devices.first_control.sync_operations(&devices.first,&remote).is_err());assert_eq!(remote.request_count(),0);
+    for store in [&devices.first,&devices.second]{store.set_egress_kill_switch(false).unwrap();store.set_sync_enabled(true,Some("test-sync-relay".into()),Some("sync-object-v1".into())).unwrap();}
+    let sent=devices.first_control.sync_operations(&devices.first,&remote).unwrap();assert!(sent["uploaded_manifests"].as_u64().unwrap()>=2);devices.second_control.sync_operations(&devices.second,&remote).unwrap();
+    let received=devices.second.export_sync_backup_deletions(devices.second.get_sync_policy_context().unwrap().context_id).unwrap();assert_eq!(received.len(),2);assert!(received.contains(&selected)&&received.contains(&large));let current=devices.second.load_sync_snapshot().unwrap();devices.second_control.sync_operations(&devices.second,&remote).unwrap();assert_eq!(devices.second.load_sync_snapshot().unwrap(),current);assert_eq!(devices.second.export_sync_backup_deletions(devices.second.get_sync_policy_context().unwrap().context_id).unwrap().len(),2);
+    for object in remote.envelopes.lock().unwrap().values(){let manifest=decrypt_manifest(&devices.data_key,object).unwrap();assert!(serde_json::to_vec(&manifest).unwrap().len()<=1024*1024);}
+    devices.first.close();devices.second.close();fs::remove_dir_all(root).unwrap();
 }

@@ -62,3 +62,21 @@ pub fn query(code: &str, ti: &TimeInterval, ds: &Datastore) -> Result<DataType, 
     };
     interpret::interpret_prog(program, ti, ds)
 }
+
+pub mod source;
+pub use source::FrozenQuerySource;
+pub fn query_controlled(
+    code: &str,
+    ti: &TimeInterval,
+    source: &FrozenQuerySource,
+    control: &aw_models::QueryControl,
+) -> Result<DataType, aw_models::ReportExecutionErrorV1> {
+    let mut lexer = lexer::ControlledLexer::new(code, control)?;
+    let parsed = parser::parse_controlled(&mut lexer, control);
+    if let Some(error) = lexer.error() {
+        return Err(error);
+    }
+    interpret::interpret_controlled(parsed?, ti, source, control)
+}
+
+pub mod reports;

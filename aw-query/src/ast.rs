@@ -10,6 +10,7 @@ pub struct Program {
 #[derive(Debug, Clone)]
 pub struct Expr {
     pub span: Span,
+    pub depth: usize,
     pub node: Expr_,
 }
 

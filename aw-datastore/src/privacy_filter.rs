@@ -18,6 +18,7 @@ pub enum PrivacyFilterAction {
 
 /// A single privacy filter rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrivacyFilterRule {
     /// If true, this rule is active
     pub enabled: bool,

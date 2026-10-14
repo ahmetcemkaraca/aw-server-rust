@@ -74,14 +74,14 @@
         "device_id": {
           "type": "string"
         },
+        "ed25519_public_key": {
+          "type": "string"
+        },
         "schema_version": {
           "const": 1,
           "type": "integer"
         },
         "x25519_public_key": {
-          "type": "string"
-        },
-        "ed25519_public_key": {
           "type": "string"
         }
       },
@@ -105,8 +105,8 @@
           "type": "string"
         },
         "data": {
-          "type": "object",
-          "additionalProperties": {}
+          "additionalProperties": true,
+          "type": "object"
         }
       },
       "required": [
@@ -127,15 +127,15 @@
             "device_id": {
               "type": "string"
             },
+            "ed25519_public_key": {
+              "type": "string"
+            },
             "schema_version": {
               "format": "uint32",
               "minimum": 0.0,
               "type": "integer"
             },
             "x25519_public_key": {
-              "type": "string"
-            },
-            "ed25519_public_key": {
               "type": "string"
             }
           },
@@ -190,15 +190,15 @@
             "device_id": {
               "type": "string"
             },
+            "ed25519_public_key": {
+              "type": "string"
+            },
             "schema_version": {
               "format": "uint32",
               "minimum": 0.0,
               "type": "integer"
             },
             "x25519_public_key": {
-              "type": "string"
-            },
-            "ed25519_public_key": {
               "type": "string"
             }
           },
@@ -245,15 +245,15 @@
             "device_id": {
               "type": "string"
             },
+            "ed25519_public_key": {
+              "type": "string"
+            },
             "schema_version": {
               "format": "uint32",
               "minimum": 0.0,
               "type": "integer"
             },
             "x25519_public_key": {
-              "type": "string"
-            },
-            "ed25519_public_key": {
               "type": "string"
             }
           },
@@ -415,7 +415,8 @@
         "upsert",
         "correction",
         "tombstone",
-        "policy_change"
+        "policy_change",
+        "backup_forget"
       ],
       "title": "SyncOperationKindV1",
       "type": "string"
@@ -426,7 +427,8 @@
         "put_if_absent",
         "get",
         "list_opaque_heads",
-        "delete_after_tombstone"
+        "delete_after_tombstone",
+        "delete_selected_backup"
       ],
       "title": "SyncRelayOperationV1",
       "type": "string"
@@ -476,7 +478,8 @@
             "put_if_absent",
             "get",
             "list_opaque_heads",
-            "delete_after_tombstone"
+            "delete_after_tombstone",
+            "delete_selected_backup"
           ],
           "type": "string"
         }

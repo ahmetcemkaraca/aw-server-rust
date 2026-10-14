@@ -17,6 +17,7 @@ chrono = { version = "0.4", features = ["serde"] }
 plex = "0.3.0"
 log = "0.4"
 fancy-regex = "0.17.0"
+url = "2.5.4"
 aw-datastore = { path = "../aw-datastore", default-features = false }
 aw-models = { path = "../aw-models" }
 aw-transform = { path = "../aw-transform" }

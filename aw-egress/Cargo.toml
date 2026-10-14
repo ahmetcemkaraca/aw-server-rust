@@ -12,6 +12,7 @@ encryption-vendored = ["aw-datastore/encryption-vendored", "dep:aw-sync-e2ee"]
 [dependencies]
 base64 = "0.22"
 aw-models = { path = "../aw-models" }
+aw-entitlements = { path = "../aw-entitlements" }
 aw-datastore = { path = "../aw-datastore", default-features = false }
 aw-sync-e2ee = { path = "../aw-sync-e2ee", optional = true }
 chrono = { version = "0.4", features = ["serde"] }

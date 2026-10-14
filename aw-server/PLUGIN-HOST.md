@@ -22,7 +22,7 @@ recursive sorted JSON object keys, no insignificant whitespace, including the
 manifest, module hash and publisher signature. It differs from `module_sha256`.
 Every mutating request identifies the exact installed package hash. Verification
 rechecks signatures, module bytes, publisher revocations and exact package review
-before install, consent, invocation and write approval.
+before install, consent, invocation, pending-result access and action/write approval.
 
 ## Routes under `/api/0/plugins`
 
@@ -33,7 +33,16 @@ before install, consent, invocation and write approval.
   `{plugin,capability_diff}` and always disables the updated package.
 - `POST /<id>/consent` accepts `{package_sha256,confirmed:true}`.
 - `POST /<id>/invoke` accepts `{package_sha256}` and returns UI text, annotation
-  writes, complete Egress previews, AI drafts, an invocation ID and expiry.
+  writes, Egress previews, AI drafts, scoped destructive previews, an invocation ID
+  and expiry. A destructive send preview withholds its Firewall token until the
+  corresponding action is separately confirmed.
+- `GET /<id>/pending` returns `{schema_version:1,invocations:[...]}` for bounded,
+  unexpired manual and background results of a currently consented package.
+- `POST /<id>/actions/approve` accepts
+  `{package_sha256,invocation_id,action_index,confirmed:true}`. Export/delete target
+  only `plugin_owned_data`, require an unchanged server-generated snapshot and
+  commit once. Export returns local JSON data. A `network:N` send action releases
+  its existing Egress preview; it does not approve or perform an outbound send.
 - `POST /<id>/writes/approve` accepts
   `{package_sha256,invocation_id,confirmed:true}`. The host retrieves the exact
   prepared annotations; clients cannot substitute write payloads. Approval is
@@ -45,11 +54,13 @@ before install, consent, invocation and write approval.
 
 All lifecycle routes require an Admin scoped local session. Installed state,
 module bytes, pending write payloads, plugin storage/events and access history
-are stored in SQLCipher (schema v13). Pending nonempty write previews are capped
-at 32; no-write invocations do not consume those slots. Installation is capped
+are stored in SQLCipher (schema v14). Pending invocations are capped at 32 and
+expire after five minutes. Manual writes/destructive actions and background UI,
+annotation, network-preview or AI-draft results occupy those slots; storage-only
+and empty outputs do not. Installation is capped
 at 32 packages and modules at 16 MiB. Only install/update accept up to 65 MiB
 of JSON to accommodate byte-array expansion; other local HTTP limits remain unchanged.
-Storage mutations and pending-write preparation share one transaction. Preparing
+Storage mutations and pending-action preparation share one transaction. Preparing
 annotations never creates activity events. Uninstall atomically erases the
 package, its storage, annotations, pending approvals and history; it preserves
 unrelated activity and content-free local revocation tombstones.
@@ -57,15 +68,23 @@ unrelated activity and content-free local revocation tombstones.
 Network intents create existing Privacy Firewall previews, never a second
 transport. The user reviews and approves/sends through the existing Egress
 routes. Update/revoke/delete serialize with in-flight sends, invalidate all
-pending outbound previews/approvals, and erase plugin write approvals. This
+pending outbound previews/approvals, and erase plugin action/write approvals. This
 conservative invalidation can require another review for unrelated outbound
 requests. Prepared AI requests are drafts for a new explicit user AI request;
 they require the existing AI preview, one-time approval and native credential
 confirmation. They are not plugin-owned send tokens or automatic requests.
 
-The current lifecycle increment does not implement background scheduling or
-generic destructive export/delete/send resource handling. Such destructive
-intents fail invocation rather than touching the vault. These are remaining
-implementation work, alongside marketplace product services and external
-review/signing/revocation/billing/support operation provisioning; they are not
-claims of complete EPIC-12 delivery.
+On a supported desktop host, the server starts a 60-second liftoff timer only
+when release trust and scoped sessions are configured. Each tick skips a locked
+vault and attempts at most one eligible, consented package, preferring the oldest
+persisted attempt (never-run packages first). Attempts reserve the manifest's
+minimum interval atomically before execution, including failed attempts; restarts
+and missed ticks never create a catch-up burst. Background execution uses the
+manifest's runtime and memory budgets plus the existing global limits. Results
+enter the same encrypted review queue; no annotation, destructive action, AI or
+network request executes automatically. Shutdown stops scheduling new work.
+
+Only the closed plugin-owned targets above are supported. Unknown resources,
+vault paths and other plugins' data fail validation. Marketplace product services
+and external review/signing/revocation/billing/support provisioning remain open;
+local source tests do not establish complete EPIC-12 release acceptance.

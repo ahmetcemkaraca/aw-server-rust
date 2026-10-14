@@ -2,6 +2,7 @@
 //   https://mozilla.github.io/firefox-browser-architecture/experiments/2017-09-21-rust-on-android.html
 
 extern crate android_logger;
+mod entitlement;
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -30,7 +31,7 @@ pub extern "C" fn rust_greeting(to: *const c_char) -> *mut c_char {
 pub mod android {
     extern crate jni;
 
-    use self::jni::objects::{JClass, JString};
+    use self::jni::objects::{JClass, JString, JObject};
     use self::jni::sys::{jboolean, jbyteArray, jdouble, jint, jstring, JNI_FALSE, JNI_TRUE};
     use self::jni::JNIEnv;
     use super::*;
@@ -159,6 +160,7 @@ pub mod android {
             server_config.port = 5600;
             server_config.auth.api_key = None;
             server_config.auth.sessions = Some(local_sessions());
+            server_config.feature_access = super::entitlement::runtime();
 
             endpoints::build_rocket(server_state, server_config)
                 .launch()
@@ -269,6 +271,16 @@ pub mod android {
     }
 
     #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_installEntitlementSource(
+        env:JNIEnv,_:JClass,source:JObject,
+    )->jboolean {
+        let installed=super::entitlement::install(&env,source).is_ok();
+        // Native billing failure must never escape into free local vault startup.
+        if env.exception_check().unwrap_or(true) { let _=env.exception_clear(); return JNI_FALSE; }
+        if installed {JNI_TRUE} else {JNI_FALSE}
+    }
+
+    #[no_mangle]
     pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_nativeLocalCommand(
         env: JNIEnv,
         _: JClass,
@@ -282,10 +294,15 @@ pub mod android {
                 .map(serde_json::Value::String)
                 .map_err(|_| "Local dashboard session is unavailable".to_string())
         } else {
-            match serde_json::from_str(&arguments) {
-                Ok(arguments) => match openDatastore() {
-                    Ok(store) => SYNC_CONTROL.invoke(&store, &command, arguments),
-                    Err(error) => Err(error),
+            match serde_json::from_str::<serde_json::Value>(&arguments) {
+                Ok(arguments) => match crate::feature_access::invoke(
+                    &super::entitlement::runtime(), &command, arguments.clone(),
+                ) {
+                    Some(result) => result,
+                    None => match openDatastore() {
+                        Ok(store) => SYNC_CONTROL.invoke(&store, &command, arguments),
+                        Err(error) => Err(error),
+                    },
                 },
                 Err(_) => Err("Invalid native operation arguments".into()),
             }

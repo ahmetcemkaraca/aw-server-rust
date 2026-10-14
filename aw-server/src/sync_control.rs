@@ -1,6 +1,6 @@
 //! Platform-neutral local E2EE controls shared by Android and desktop command adapters.
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::collections::{BTreeMap, VecDeque};
 
 use aw_datastore::{
@@ -187,7 +187,12 @@ fn append_local_manifests(
         let page = store.list_sync_operations(*identity.device_id_bytes(), key_epoch, after_counter, 256)
             .map_err(|_| "The encrypted sync operation log could not be read")?;
         if page.is_empty() && acknowledgement_cursor == acknowledgements.len() { break; }
-        let mut count = page.len().min(MAX_OPERATIONS_PER_MANIFEST);
+        let mut count=0usize;let mut encoded_bytes=1024usize;
+        for record in page.iter().take(MAX_OPERATIONS_PER_MANIFEST) {
+            let next=encoded_bytes.checked_add(record.operation_json.len()+1).ok_or("The local manifest byte budget overflowed")?;
+            if next>aw_models::SYNC_MAX_CHUNK_BYTES {if count==0 {count=1;}break;}
+            encoded_bytes=next;count+=1;
+        }
         let mut acknowledgement_count = (acknowledgements.len() - acknowledgement_cursor)
             .min(MAX_TOMBSTONE_ACKS_PER_MANIFEST);
         let (manifest, envelope) = loop {
@@ -282,10 +287,9 @@ fn load_or_create_device_identity(store: &Datastore) -> Result<(DeviceIdentityV1
 
 fn create_sync_pairing(control: &SyncControl, store: &Datastore, args: Value) -> Result<Value, String> {
     let recipient: aw_models::DevicePublicIdentityV1 = argument(&args, "recipient")?;
+    let mut pending = control.idle_workflow()?;
     let (identity, _) = load_or_create_device_identity(store)?;
     let (invitation, ephemeral) = begin_pairing(&identity, &recipient).map_err(|error| error.to_string())?;
-    let mut pending = control.pairing.lock().map_err(|_| "Device pairing state is unavailable")?;
-    if pending.is_some() { return Err("Finish or cancel the current device pairing first".into()); }
     *pending = Some(PendingPairing {
         identity, invitation: invitation.clone(), recipient: false,
         ephemeral: Some(ephemeral), offer: None, session: None,
@@ -295,10 +299,9 @@ fn create_sync_pairing(control: &SyncControl, store: &Datastore, args: Value) ->
 
 fn respond_sync_pairing(control: &SyncControl, store: &Datastore, args: Value) -> Result<Value, String> {
     let invitation: PairingInvitationV1 = argument(&args, "invitation")?;
+    let mut pending = control.idle_workflow()?;
     let (identity, _) = load_or_create_device_identity(store)?;
     let (response, ephemeral) = respond_to_pairing(&identity, &invitation).map_err(|error| error.to_string())?;
-    let mut pending = control.pairing.lock().map_err(|_| "Device pairing state is unavailable")?;
-    if pending.is_some() { return Err("Finish or cancel the current device pairing first".into()); }
     *pending = Some(PendingPairing {
         identity, invitation, recipient: true,
         ephemeral: Some(ephemeral), offer: None, session: None,
@@ -430,14 +433,17 @@ struct SyncRestorePreview {
     query_start: Option<String>,
     query_end: Option<String>,
     policy_conflict_count: usize,
+    policy_continuity_present: bool,
+    #[serde(skip)]
+    target_policy_sha256: String,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-struct SyncRecoverySnapshotV1 {
-    schema_version: u32,
-    activity: BucketsExport,
-    sync: SyncRecoveryStateV1,
+pub struct SyncRecoverySnapshotV1 {
+    pub schema_version: u32,
+    pub activity: BucketsExport,
+    pub sync: SyncRecoveryStateV1,
 }
 
 #[derive(Serialize)]
@@ -450,8 +456,41 @@ struct SyncTombstoneStatus {
 }
 
 impl SyncControl {
+    // Hold the pairing lock through any operation that can install recovery keys.
+    // A recipient must remain keyless until its active pairing transfers keys.
+    fn idle_workflow(&self) -> Result<MutexGuard<'_, Option<PendingPairing>>, String> {
+        let pending = self.pairing.lock().map_err(|_| "Device pairing state is unavailable")?;
+        if self.recovery_kit_pending.load(Ordering::Acquire) {
+            return Err("Save or cancel the current one-time recovery phrase first".into());
+        }
+        if pending.is_some() {
+            return Err("Finish or cancel the current device pairing first".into());
+        }
+        Ok(pending)
+    }
+
     pub fn invoke(&self, store: &Datastore, command: &str, args: Value) -> Result<Value, String> {
         match command {
+            "preview_selected_sync_backup_restore" | "restore_selected_sync_backup" => {
+                if !args.is_object() {return Err("Selected restore arguments must be an object".into());}
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Request {#[serde(rename="requestJson")] raw:String, #[serde(rename="userAccepted")] accepted:Option<bool>}
+                let request:Request=serde_json::from_value(args).map_err(|_|"Selected restore arguments are invalid")?;
+                if command=="restore_selected_sync_backup" && request.accepted!=Some(true) {
+                    return Err("Review and accept the restore preview before restoring activity".into());
+                }
+                let input=crate::backup::selected_restore_input(store,request.raw)?;
+                let args=json!({"kit":input.kit,"recoveryPhrase":input.phrase.as_str(),"snapshot":input.snapshot,"userAccepted":true,"expectedContext":input.target_context_id});
+                let output=if command=="preview_selected_sync_backup_restore" {preview_recovery_restore(store,args)?} else {self.restore_recovery_kit(store,args)?};
+                serde_json::to_string(&output).map(Value::String).map_err(|_|"Selected restore result could not be encoded".into())
+            }
+            "get_sync_backup_context" => {
+                if args!=json!({}) {return Err("Backup context takes no arguments".into());}
+                let context=store.get_sync_policy_context().map_err(|_|"Unlock the encrypted vault to browse backups")?;
+                serde_json::to_value(context).map_err(|_|"Backup context could not be encoded".into())
+            }
+            "list_sync_backups" | "export_selected_sync_backup" | "preview_sync_backup_delete" | "delete_selected_sync_backup" => crate::backup::invoke(store,command,args),
             "create_local_sync_identity" => create_local_sync_identity(store),
             "list_sync_devices" => list_sync_devices(store),
             "list_sync_device_access_history" => list_sync_device_access_history(store),
@@ -473,6 +512,7 @@ impl SyncControl {
             "create_sync_recovery_kit" => self.create_recovery_kit(store),
             "create_current_sync_snapshot" => self.create_current_sync_snapshot(store),
             "cancel_sync_recovery_kit" => {
+                let _workflow = self.pairing.lock().map_err(|_| "Device pairing state is unavailable")?;
                 self.recovery_kit_pending.store(false, Ordering::Release);
                 Ok(Value::Null)
             }
@@ -744,6 +784,7 @@ impl SyncControl {
     }
 
     fn create_recovery_kit(&self, store: &Datastore) -> Result<Value, String> {
+        let _workflow = self.idle_workflow()?;
         self.recovery_kit_pending
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| "Save or cancel the current one-time recovery phrase first")?;
@@ -772,6 +813,7 @@ impl SyncControl {
         if args.get("userConfirmed").and_then(Value::as_bool) != Some(true) {
             return Err("Confirm only after saving the recovery phrase".into());
         }
+        let _workflow = self.pairing.lock().map_err(|_| "Device pairing state is unavailable")?;
         if !self.recovery_kit_pending.load(Ordering::Acquire) {
             return Err("Create a recovery kit before confirming it was saved".into());
         }
@@ -858,12 +900,14 @@ impl SyncControl {
         if args.get("userAccepted").and_then(Value::as_bool) != Some(true) {
             return Err("Review and accept the restore preview before restoring activity".into());
         }
+        let _workflow = self.idle_workflow()?;
+        let expected_context=args.get("expectedContext").and_then(Value::as_str).map(str::to_owned);
         let (material, snapshot, export, preview) = validate_recovery_restore(store, args)?;
         let identity = generate_device_identity().map_err(|error| error.to_string())?;
         let local_identity = SyncDeviceIdentity::new(
             *identity.device_id_bytes(), identity.secret_for_storage(), identity.signing_seed_for_storage(),
         );
-        store.restore_sync_recovery_data(export.activity, material, snapshot, export.sync, local_identity)
+        store.restore_sync_recovery_data_with_context(export.activity, material, snapshot, export.sync, local_identity,Some(preview.target_policy_sha256.clone()),expected_context)
             .map_err(|_| "The encrypted activity snapshot could not be restored atomically".to_string())?;
         self.recovery_kit_pending.store(true, Ordering::Release);
         serde_json::to_value(preview).map_err(|_| "Restore preview could not be encoded".into())
@@ -981,7 +1025,8 @@ fn rotated_sync_key_material(store: &Datastore) -> Result<(SyncKeyMaterial, Vaul
     Ok((material_from_keys(&next_root, &next_wrapped)?, data_key))
 }
 
-fn encrypt_current_snapshot(store: &Datastore, data_key: &VaultDataKeyV1) -> Result<SyncSnapshotV1, String> {
+/// Encrypt activity and its stable sync identities for native recovery adapters.
+pub fn encrypt_current_snapshot(store: &Datastore, data_key: &VaultDataKeyV1) -> Result<SyncSnapshotV1, String> {
     let plaintext = current_activity_plaintext(store, data_key)?;
     let encrypted = encrypt_snapshot(data_key, &plaintext).map_err(|error| error.to_string())?;
     let verified = decrypt_snapshot(data_key, &encrypted).map_err(|error| error.to_string())?;
@@ -989,6 +1034,34 @@ fn encrypt_current_snapshot(store: &Datastore, data_key: &VaultDataKeyV1) -> Res
         return Err("The staged activity snapshot did not verify".into());
     }
     Ok(SyncSnapshotV1::new(decode_fixed::<16>(&encrypted.snapshot_id)?, encrypted.envelopes))
+}
+
+/// Authenticate the shared recovery payload and require its current key epoch.
+pub fn decrypt_recovery_snapshot(
+    data_key: &VaultDataKeyV1,
+    snapshot: &EncryptedSyncSnapshotV1,
+) -> Result<SyncRecoverySnapshotV1, String> {
+    snapshot.validate().map_err(|error| error.to_string())?;
+    let plaintext = decrypt_snapshot(data_key, snapshot).map_err(|error| error.to_string())?;
+    let recovery: SyncRecoverySnapshotV1 = serde_json::from_slice(&plaintext)
+        .map_err(|_| "The encrypted activity snapshot is invalid")?;
+    if recovery.schema_version != 1
+        || recovery.sync.schema_version != SYNC_SCHEMA_VERSION_V1
+        || recovery.sync.key_epoch != data_key.key_epoch()
+    {
+        return Err("The encrypted sync recovery state is invalid".into());
+    }
+    if let Some(policy) = &recovery.sync.policy {
+        aw_datastore::validate_sync_recovery_policy_v1(policy)
+            .map_err(|_| "The encrypted recovery policy is invalid")?;
+    }
+    aw_datastore::validate_sync_recovery_state_v1(&recovery.sync,&recovery.activity,data_key.key_epoch())
+        .map_err(|_| "The encrypted recovery continuity is invalid")?;
+    let objects:std::collections::BTreeSet<_>=snapshot.envelopes.iter().map(|o|o.object_id.as_str()).collect();
+    if recovery.sync.backup_deletions.iter().any(|f|(f.vault_id==URL_SAFE_NO_PAD.encode(data_key.vault_id()) && f.key_epoch==data_key.key_epoch().to_string() && f.snapshot_id==snapshot.snapshot_id) || f.objects.iter().any(|o|objects.contains(o.object_id.as_str()))) {
+        return Err("The recovery artifact includes its own deletion fact".into());
+    }
+    Ok(recovery)
 }
 
 fn current_activity_plaintext(store: &Datastore, data_key: &VaultDataKeyV1) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -1065,15 +1138,7 @@ fn export_sync_snapshot(store: &Datastore) -> Result<Value, String> {
         snapshot_id: URL_SAFE_NO_PAD.encode(stored.snapshot_id),
         envelopes: stored.envelopes,
     };
-    let plaintext = decrypt_snapshot(&data_key, &export).map_err(|error| error.to_string())?;
-    let recovery: SyncRecoverySnapshotV1 = serde_json::from_slice(&plaintext)
-        .map_err(|_| "The encrypted sync snapshot is invalid")?;
-    if recovery.schema_version != 1
-        || recovery.sync.schema_version != SYNC_SCHEMA_VERSION_V1
-        || recovery.sync.key_epoch != keys.key_epoch()
-    {
-        return Err("The encrypted sync snapshot does not match the current key epoch".into());
-    }
+    decrypt_recovery_snapshot(&data_key, &export)?;
     serde_json::to_value(export).map_err(|_| "Encrypted snapshot could not be encoded".into())
 }
 
@@ -1207,15 +1272,13 @@ fn validate_recovery_restore(
     let recovered = open_recovery_kit(&kit, phrase).map_err(|error| error.to_string())?;
     let data_key = unwrap_vault_data_key(&recovered.account_root_key, &recovered.wrapped_vault_key)
         .map_err(|error| error.to_string())?;
-    let plaintext = decrypt_snapshot(&data_key, &snapshot).map_err(|error| error.to_string())?;
-    let export: SyncRecoverySnapshotV1 = serde_json::from_slice(&plaintext)
-        .map_err(|_| "The encrypted activity snapshot is invalid")?;
-    if export.schema_version != 1
-        || export.sync.schema_version != SYNC_SCHEMA_VERSION_V1
-        || export.sync.key_epoch != recovered.wrapped_vault_key.key_epoch
-    {
-        return Err("The encrypted sync recovery state is invalid".into());
-    }
+    let export = decrypt_recovery_snapshot(&data_key, &snapshot)?;
+    let lease=store.egress_lease().map_err(|_|"The recovery target is unavailable")?;
+    let context=lease.sync_policy_context().map_err(|_|"The recovery target is unavailable")?.context_id;
+    lease.ensure_sync_backup_not_deleted(context,URL_SAFE_NO_PAD.encode(data_key.vault_id()),data_key.key_epoch(),snapshot.snapshot_id.clone(),snapshot.envelopes.iter().map(|o|o.object_id.clone()).collect())
+        .map_err(|_|"This backup was already deleted in the target vault")?;
+    drop(lease);
+
 
     let mut query_start: Option<String> = None;
     let mut query_end: Option<String> = None;
@@ -1234,6 +1297,8 @@ fn validate_recovery_restore(
         .map_err(|_| "The encrypted vault cannot inspect its device identity")?
         .map(|identity| URL_SAFE_NO_PAD.encode(identity.device_id()));
     let snapshot_id = snapshot.snapshot_id.clone();
+    let policies = store.preview_sync_recovery_policy(export.sync.clone(),data_key.vault_id(),data_key.key_epoch(),decode_fixed::<16>(&snapshot.snapshot_id)?,false)
+        .map_err(|_| "The encrypted recovery policy could not be compared to local settings")?;
     let preview = SyncRestorePreview {
         schema_version: snapshot.schema_version,
         device_id,
@@ -1246,7 +1311,9 @@ fn validate_recovery_restore(
         tombstone_count: export.sync.event_mappings.iter().filter(|mapping| mapping.deleted).count(),
         query_start,
         query_end,
-        policy_conflict_count: 0,
+        policy_conflict_count: policies.conflict_count,
+        policy_continuity_present: policies.continuity_present,
+        target_policy_sha256: policies.target_binding_sha256,
     };
     let material = material_from_keys(&recovered.account_root_key, &recovered.wrapped_vault_key)?;
     let stored_snapshot = SyncSnapshotV1::new(decode_fixed::<16>(&snapshot.snapshot_id)?, snapshot.envelopes);

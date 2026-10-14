@@ -23,10 +23,22 @@ pub mod config;
 pub mod device_id;
 pub mod dirs;
 pub mod endpoints;
+pub mod feature_access;
 pub mod logging;
 pub mod sessions;
+pub mod reports;
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
 pub mod sync_control;
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+pub mod backup;
+#[cfg(feature = "companion")]
+pub mod companion;
+#[cfg(feature = "companion")]
+pub mod companion_entitlements;
+#[cfg(feature = "companion")]
+pub mod companion_network;
+#[cfg(feature = "companion")]
+pub mod companion_release_trust;
 #[cfg(all(feature = "plugin-runtime", any(feature = "encryption", feature = "encryption-vendored")))]
 pub mod plugin_host;
 pub use aw_models::CapturePolicy;

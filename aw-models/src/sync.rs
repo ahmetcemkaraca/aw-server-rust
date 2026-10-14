@@ -77,6 +77,7 @@ pub enum SyncRelayOperationV1 {
     Get,
     ListOpaqueHeads,
     DeleteAfterTombstone,
+    DeleteSelectedBackup,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -102,7 +103,7 @@ impl SyncRelayRequestV1 {
             return Err(SyncWireErrorV1::UnknownVersion);
         }
         match self.operation {
-            SyncRelayOperationV1::PutIfAbsent => {
+            SyncRelayOperationV1::PutIfAbsent | SyncRelayOperationV1::DeleteSelectedBackup => {
                 let object_id = self.object_id.as_deref().ok_or(SyncWireErrorV1::InvalidSyncRequest)?;
                 let vault_id = self.vault_id.as_deref().ok_or(SyncWireErrorV1::InvalidSyncRequest)?;
                 validate_base64_length(object_id, SYNC_ID_BYTES)?;
@@ -169,7 +170,7 @@ impl SyncRelayResponseV1 {
                 && self.next_cursor.is_none() && self.objects.is_empty(),
             SyncRelayOperationV1::ListOpaqueHeads => self.inserted.is_none() && self.deleted.is_none()
                 && self.envelope.is_none() && self.objects.len() <= request.limit.unwrap_or(0) as usize,
-            SyncRelayOperationV1::DeleteAfterTombstone => self.deleted.is_some() && self.inserted.is_none()
+            SyncRelayOperationV1::DeleteAfterTombstone | SyncRelayOperationV1::DeleteSelectedBackup => self.deleted.is_some() && self.inserted.is_none()
                 && self.envelope.is_none() && self.next_cursor.is_none() && self.objects.is_empty(),
         };
         if !valid { return Err(SyncWireErrorV1::InvalidSyncRequest); }
@@ -425,6 +426,7 @@ pub enum SyncOperationKindV1 {
     Correction,
     Tombstone,
     PolicyChange,
+    BackupForget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

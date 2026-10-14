@@ -68,7 +68,7 @@ fn service_status(trust: &PluginTrust, vault_available: bool) -> PluginServiceSt
 #[cfg(all(feature = "plugin-runtime", any(feature = "encryption", feature = "encryption-vendored")))]
 pub mod lifecycle {
     use super::*;
-    use aw_datastore::{Datastore, plugins::{StoredPluginV1, PluginOperationV1 as Op, PluginResultV1 as ResultV1, plugin_package_hash}};
+    use aw_datastore::{Datastore, plugins::{StoredPluginV1, PluginInvocationPreviewV1, PluginActionInputsV1, PluginOperationV1 as Op, PluginResultV1 as ResultV1, plugin_package_hash}};
     use aw_models::{SignedPluginPackageV1, plugin_capability_diff_v1};
     use aw_plugin_runtime::{verify_plugin_package_v1, PluginRuntimeV1, VerifiedPluginPackageV1};
     use aw_egress::EgressProxy;
@@ -113,6 +113,9 @@ pub mod lifecycle {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct ApproveRequest { invocation_id: String, package_sha256: String, confirmed: bool }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ApproveActionRequest { invocation_id: String, package_sha256: String, action_index: usize, confirmed: bool }
 
     fn error(status: Status, message: &str) -> HttpErrorJson { HttpErrorJson::new(status, message.into()) }
     fn available(store: &Datastore, scoped: bool) -> Result<(), HttpErrorJson> {
@@ -235,26 +238,97 @@ pub mod lifecycle {
             let plugin = stored(&store, &plugin_id, Some(&request.package_sha256))?;
             if !plugin.installed.enabled || plugin.installed.revoked { return Err(error(Status::Forbidden, "Plugin is disabled or requires consent")); }
             let package = verified(&trust, &plugin.package, &plugin.module_bytes)?;
-            let runtime = PluginRuntimeV1::new().map_err(|_| error(Status::ServiceUnavailable, "Sandbox unavailable"))?;
-            let compiled = runtime.compile_verified(&package).map_err(|_| error(Status::UnprocessableEntity, "Invalid plugin module"))?;
-            let input = crate::plugin_host::prepare_plugin_input(&store, package.manifest(), Utc::now()).map_err(|_| error(Status::Forbidden, "Plugin input exceeds its grants or limits"))?;
-            let settings = store.get_ai_settings().map_err(HttpErrorJson::from)?;
-            let active_profile = if settings.mode == aw_models::AIAccessModeV1::CustomEndpoint { settings.active_connection_id.as_deref() } else { None };
-            let output = runtime.invoke(&compiled, &input, active_profile).map_err(|_| error(Status::UnprocessableEntity, "Plugin exceeded sandbox limits or returned ungranted effects"))?;
-            if !output.as_inner().destructive.is_empty() { return Err(error(Status::ServiceUnavailable, "Generic destructive plugin actions are unavailable; use explicit host controls")); }
-            let (ui, writes, storage, network_previews, ai_requests) = if output.as_inner().network.is_empty() && output.as_inner().ai.is_empty() {
-                let output = output.into_inner();
-                (output.ui, output.writes, output.storage, vec![], vec![])
-            } else {
-                let policy = active_policy(&store, &policy_trust)?;
-                let actions = crate::plugin_host::prepare_plugin_actions(&store, &proxy, &policy, package.manifest(), output, active_profile, Utc::now(), chrono::Local::now().offset().local_minus_utc())
-                    .map_err(|_| error(Status::Forbidden, "Plugin actions do not match active Egress or AI policy"))?;
-                (actions.ui, actions.writes, actions.storage, actions.network_previews, actions.ai_requests)
-            };
-            let invocation_id = uuid::Uuid::new_v4().to_string();
-            let ResultV1::Prepared(expires_at) = operation(&store, Op::PrepareWrites { plugin_id, expected: request.package_sha256.clone(), invocation_id: invocation_id.clone(), writes: writes.clone(), storage })? else { unreachable!() };
-            Ok(Json(json!({"schema_version":1,"invocation_id":invocation_id,"package_sha256":request.package_sha256,"ui":ui,"writes":writes,"network_previews":network_previews,"ai_requests":ai_requests,"destructive_confirmations":[],"expires_at":expires_at})))
+            Ok(Json(json!(invoke_package(&store, plugin, package, &policy_trust, &proxy, false)?)))
         }).await.map_err(|_| error(Status::ServiceUnavailable, "Plugin invocation unavailable"))?
+    }
+
+    // Both manual and scheduled runs prepare the same package-bound approval queue.
+    fn invoke_package(store: &Datastore, plugin: StoredPluginV1, package: VerifiedPluginPackageV1, policy_trust: &EgressPolicyTrust, proxy: &EgressProxy, background: bool) -> Result<PluginInvocationPreviewV1, HttpErrorJson> {
+        let runtime = PluginRuntimeV1::new().map_err(|_| error(Status::ServiceUnavailable, "Sandbox unavailable"))?;
+        let compiled = runtime.compile_verified(&package).map_err(|_| error(Status::UnprocessableEntity, "Invalid plugin module"))?;
+        let input = crate::plugin_host::prepare_plugin_input(store, package.manifest(), Utc::now()).map_err(|_| error(Status::Forbidden, "Plugin input exceeds its grants or limits"))?;
+        let settings = store.get_ai_settings().map_err(HttpErrorJson::from)?;
+        let active_profile = if settings.mode == aw_models::AIAccessModeV1::CustomEndpoint { settings.active_connection_id.as_deref() } else { None };
+        let output = if background { runtime.invoke_background(&compiled, &input, active_profile) } else { runtime.invoke(&compiled, &input, active_profile) }
+            .map_err(|_| error(Status::UnprocessableEntity, "Plugin exceeded sandbox limits or returned ungranted effects"))?;
+        let actions = if output.as_inner().network.is_empty() && output.as_inner().ai.is_empty() {
+            let output = output.into_inner();
+            PluginActionInputsV1 { ui: output.ui, writes: output.writes, storage: output.storage, destructive_confirmations: output.destructive, ..Default::default() }
+        } else {
+            let policy = active_policy(store, policy_trust)?;
+            crate::plugin_host::prepare_plugin_actions(store, proxy, &policy, package.manifest(), output, active_profile, Utc::now(), chrono::Local::now().offset().local_minus_utc())
+                .map_err(|_| error(Status::Forbidden, "Plugin actions do not match active Egress or AI policy"))?
+        };
+        match operation(store, Op::PrepareInvocation { plugin_id: plugin.installed.manifest.plugin_id, expected: plugin.installed.package_sha256, invocation_id: uuid::Uuid::new_v4().to_string(), actions, background })? {
+            ResultV1::Preview(preview) => Ok(preview),
+            _ => Err(error(Status::ServiceUnavailable, "Plugin action preview unavailable")),
+        }
+    }
+
+    #[get("/<plugin_id>/pending")]
+    pub fn pending(plugin_id: String, state: &State<ServerState>, config: &State<AWConfig>, trust: &State<PluginTrust>) -> Result<Json<Value>, HttpErrorJson> {
+        available(&state.datastore, config.auth.sessions.is_some())?;
+        let _gate = lock(trust)?;
+        let plugin = stored(&state.datastore, &plugin_id, None)?;
+        if !plugin.installed.enabled || plugin.installed.revoked { return Err(error(Status::Conflict, "Plugin is disabled or requires consent")); }
+        verified(trust, &plugin.package, &plugin.module_bytes)?;
+        let ResultV1::Pending(invocations) = operation(&state.datastore, Op::Pending(plugin_id))? else { unreachable!() };
+        Ok(Json(json!({"schema_version":1,"invocations":invocations})))
+    }
+
+    #[post("/<plugin_id>/actions/approve", data = "<request>", format = "application/json")]
+    pub fn approve_action(plugin_id: String, request: Json<ApproveActionRequest>, state: &State<ServerState>, config: &State<AWConfig>, trust: &State<PluginTrust>) -> Result<Json<Value>, HttpErrorJson> {
+        available(&state.datastore, config.auth.sessions.is_some())?; confirmed(request.confirmed)?;
+        let _gate = lock(trust)?;
+        let plugin = stored(&state.datastore, &plugin_id, Some(&request.package_sha256))?;
+        verified(trust, &plugin.package, &plugin.module_bytes)?;
+        let ResultV1::Action(result) = operation(&state.datastore, Op::ApproveAction { plugin_id, expected: request.package_sha256.clone(), invocation_id: request.invocation_id.clone(), action_index: request.action_index })? else { unreachable!() };
+        Ok(Json(result))
+    }
+
+    /// Attempt one due package; persisted timestamps make this safe across restarts.
+    pub fn run_background(store: &Datastore, scoped: bool, trust: &PluginTrust, policy: &EgressPolicyTrust, proxy: &EgressProxy, now: chrono::DateTime<Utc>) -> usize {
+        if !trust.ready() || available(store, scoped).is_err() { return 0; }
+        let Ok(_gate) = lock(trust) else { return 0; };
+        let Ok(ResultV1::List(mut plugins)) = operation(store, Op::List) else { return 0; };
+        plugins.sort_by(|a,b| a.last_background_run_at.cmp(&b.last_background_run_at).then_with(|| a.manifest.plugin_id.cmp(&b.manifest.plugin_id)));
+        for plugin in plugins.into_iter().filter(|plugin| plugin.background_due(now)) {
+            let Ok(stored) = stored(store, &plugin.manifest.plugin_id, Some(&plugin.package_sha256)) else { continue; };
+            let Ok(package) = verified(trust, &stored.package, &stored.module_bytes) else { continue; };
+            if !matches!(operation(store, Op::BeginBackground { plugin_id: plugin.manifest.plugin_id.clone(), expected: plugin.package_sha256.clone(), now }), Ok(ResultV1::Due(true))) { continue; }
+            if invoke_package(store, stored, package, policy, proxy, true).is_err() {
+                let _ = operation(store, Op::BackgroundFailed { plugin_id: plugin.manifest.plugin_id, expected: plugin.package_sha256 });
+            }
+            return 1;
+        }
+        0
+    }
+
+    pub fn background_scheduler() -> rocket::fairing::AdHoc {
+        rocket::fairing::AdHoc::on_liftoff("Permissioned plugin background scheduler", |rocket| Box::pin(async move {
+            let Some(trust) = rocket.state::<PluginTrust>() else { return; };
+            let Some(config) = rocket.state::<AWConfig>() else { return; };
+            let scoped = config.auth.sessions.is_some();
+            if !scoped || !trust.ready() { return; }
+            let store = rocket.state::<ServerState>().expect("Managed server state").datastore.clone();
+            let (trust, policy, proxy) = (trust.clone(), rocket.state::<EgressPolicyTrust>().expect("Managed Egress trust").clone(), rocket.state::<EgressProxy>().expect("Managed Egress proxy").clone());
+            let shutdown = rocket.shutdown();
+            rocket::tokio::spawn(async move {
+                use rocket::tokio::time::{Duration, Instant, MissedTickBehavior};
+                let mut timer = rocket::tokio::time::interval_at(Instant::now() + Duration::from_secs(60), Duration::from_secs(60));
+                timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                loop {
+                    rocket::tokio::select! {
+                        _ = shutdown.clone() => break,
+                        _ = timer.tick() => {
+                            let (store, trust, policy, proxy) = (store.clone(), trust.clone(), policy.clone(), proxy.clone());
+                            let work = rocket::tokio::task::spawn_blocking(move || run_background(&store, scoped, &trust, &policy, &proxy, Utc::now()));
+                            rocket::tokio::select! { _ = shutdown.clone() => break, _ = work => {} }
+                        }
+                    }
+                }
+            });
+        }))
     }
     #[post("/<plugin_id>/writes/approve", data = "<request>", format = "application/json")]
     pub fn approve_writes(plugin_id: String, request: Json<ApproveRequest>, state: &State<ServerState>, config: &State<AWConfig>, trust: &State<PluginTrust>) -> Result<Json<Value>, HttpErrorJson> {

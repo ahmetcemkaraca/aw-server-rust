@@ -1,15 +1,12 @@
 use std::collections::BTreeMap;
 
 use crate::merge::{
-    create_event_correction, create_event_tombstone, create_event_upsert, decode_sync_data_field_v1,
-    encode_sync_data_field_v1, merge_operations,
-    pending_tombstone_ack_device_ids,
-    tombstone_collectible, ManifestDecisionV1, MergeErrorV1, SyncHeadV1, SyncManifestV1,
-    SyncOperationV1, SyncTombstoneAckV1,
+    create_event_correction, create_event_tombstone, create_event_upsert,
+    decode_sync_data_field_v1, encode_sync_data_field_v1, merge_operations,
+    pending_tombstone_ack_device_ids, tombstone_collectible, ManifestDecisionV1, MergeErrorV1,
+    SyncHeadV1, SyncManifestV1, SyncOperationV1, SyncTombstoneAckV1,
 };
-use crate::{
-    create_vault_data_key, decrypt_manifest, encrypt_manifest, generate_account_root_key,
-};
+use crate::{create_vault_data_key, decrypt_manifest, encrypt_manifest, generate_account_root_key};
 use aw_models::{Event, SyncBucketDescriptorV1, SyncChunkHeaderV1, SyncOperationKindV1};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -34,6 +31,119 @@ fn signing_identity(device: u8) -> DeviceIdentityV1 {
     )
 }
 
+fn policy_op(device: u8, counter: u64, version: u64, field: &str, value: Value) -> SyncOperationV1 {
+    crate::create_policy_change(
+        [device; 16],
+        counter,
+        version,
+        BTreeMap::from([(field.into(), value)]),
+    )
+    .unwrap()
+}
+
+#[test]
+fn policy_current_sequential_edits_by_one_writer_do_not_remain_conflicts() {
+    let history = vec![
+        policy_op(1, 1, 1, "settings.theme", json!("light")),
+        policy_op(1, 2, 2, "settings.theme", json!("dark")),
+    ];
+    assert!(merge_operations(&[], &history)
+        .unwrap()
+        .pending_policy_conflict
+        .is_none());
+}
+
+#[test]
+fn policy_current_independent_fields_do_not_conflict() {
+    let history = vec![
+        policy_op(1, 1, 1, "settings.theme", json!("dark")),
+        policy_op(2, 1, 4, "settings.startOfDay", json!("04:00")),
+    ];
+    assert!(merge_operations(&[], &history)
+        .unwrap()
+        .pending_policy_conflict
+        .is_none());
+}
+
+#[test]
+fn policy_current_equal_values_with_different_versions_do_not_conflict() {
+    let history = vec![
+        policy_op(1, 1, 1, "settings.theme", json!("dark")),
+        policy_op(2, 2, 7, "settings.theme", json!("dark")),
+    ];
+    assert!(merge_operations(&[], &history)
+        .unwrap()
+        .pending_policy_conflict
+        .is_none());
+}
+
+#[test]
+fn policy_current_divergence_uses_only_latest_scoped_writers_and_no_values() {
+    let first = policy_op(1, 1, 1, "settings.theme", json!("PRIVATE_OLD"));
+    let latest = policy_op(1, 3, 3, "settings.theme", json!("PRIVATE_CURRENT"));
+    let other = policy_op(2, 2, 2, "settings.theme", json!("PRIVATE_OTHER"));
+    let unrelated = policy_op(3, 4, 8, "settings.startOfDay", json!("04:00"));
+    let history = vec![first, latest.clone(), other, unrelated];
+    let pending = merge_operations(&[], &history)
+        .unwrap()
+        .pending_policy_conflict
+        .unwrap();
+    assert_eq!(pending.versions, vec![2, 3]);
+    assert_eq!(pending.fields, vec!["settings.theme"]);
+    assert_eq!(
+        pending.devices,
+        vec![
+            URL_SAFE_NO_PAD.encode([1; 16]),
+            URL_SAFE_NO_PAD.encode([2; 16])
+        ]
+    );
+    let metadata = serde_json::to_value(&pending).unwrap();
+    assert!(!metadata.to_string().contains("PRIVATE_"));
+    assert!(!metadata.to_string().contains("settings.theme"));
+    let mut reversed = history.clone();
+    reversed.reverse();
+    reversed.push(latest.clone());
+    assert_eq!(
+        serde_json::to_value(
+            merge_operations(&[], &reversed)
+                .unwrap()
+                .pending_policy_conflict
+                .unwrap()
+        )
+        .unwrap(),
+        metadata
+    );
+    let mut fork = latest;
+    fork.fields.insert("settings.theme".into(), json!("FORGED"));
+    reversed.push(fork);
+    assert!(matches!(
+        merge_operations(&[], &reversed),
+        Err(MergeErrorV1::OperationFork)
+    ));
+}
+
+#[test]
+fn policy_current_candidates_borrow_values_and_reject_changed_counter_replays() {
+    let history = vec![
+        policy_op(1, 1, 1, "settings.theme", json!("light")),
+        policy_op(1, 3, 4, "settings.theme", json!("dark")),
+    ];
+    let candidates = crate::latest_policy_fields(history.iter()).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].operation.counter, 3);
+    assert!(std::ptr::eq(
+        candidates[0].value,
+        history[1].fields.get("settings.theme").unwrap()
+    ));
+    let mut fork = history[1].clone();
+    fork.fields
+        .insert("settings.startOfDay".into(), json!("05:00"));
+    assert!(matches!(
+        crate::latest_policy_fields(history.iter().chain(std::iter::once(&fork))),
+        Err(MergeErrorV1::OperationFork)
+    ));
+}
+
 fn event_op(
     device: u8,
     counter: u64,
@@ -50,8 +160,11 @@ fn event_op(
         sync_bucket_id: Some(URL_SAFE_NO_PAD.encode([0x66u8; 16])),
         bucket_descriptor,
         kind,
-        policy_version: None,
-        fields: fields.iter().map(|(key, value)| ((*key).into(), value.clone())).collect(),
+        backup_forget_fragment:None,        policy_version: None,
+        fields: fields
+            .iter()
+            .map(|(key, value)| ((*key).into(), value.clone()))
+            .collect(),
     }
 }
 
@@ -64,17 +177,27 @@ fn local_event_operations_preserve_origin_and_correction_scope() {
         "data": {"app":"Editor","title":"SYNTHETIC_TITLE"}
     }))
     .unwrap();
-    event.data.insert("timestamp".into(), json!("user data value"));
+    event
+        .data
+        .insert("timestamp".into(), json!("user data value"));
     let unusual_key = "data:\nprivate";
-    event.data.insert(unusual_key.into(), json!("private key name"));
+    event
+        .data
+        .insert(unusual_key.into(), json!("private key name"));
     let device = [1u8; 16];
     let origin = device;
     let upsert = create_event_upsert(device, 1, [0x66; 16], bucket_descriptor(), &event).unwrap();
     assert_eq!(upsert.origin_device_id, URL_SAFE_NO_PAD.encode(origin));
     assert_eq!(upsert.local_event_id, Some(42));
-    assert_eq!(upsert.sync_bucket_id, Some(URL_SAFE_NO_PAD.encode([0x66; 16])));
+    assert_eq!(
+        upsert.sync_bucket_id,
+        Some(URL_SAFE_NO_PAD.encode([0x66; 16]))
+    );
     assert_eq!(upsert.bucket_descriptor, Some(bucket_descriptor()));
-    assert_eq!(upsert.fields["timestamp"], json!("2026-09-23T12:00:00+00:00"));
+    assert_eq!(
+        upsert.fields["timestamp"],
+        json!("2026-09-23T12:00:00+00:00")
+    );
     assert_eq!(upsert.fields["duration_ns"], json!(7_000_000_000i64));
     assert_eq!(upsert.fields["data:title"], json!("SYNTHETIC_TITLE"));
     assert_eq!(upsert.fields["data:timestamp"], json!("user data value"));
@@ -82,7 +205,10 @@ fn local_event_operations_preserve_origin_and_correction_scope() {
     assert_eq!(encode_sync_data_field_v1("timestamp"), "data:timestamp");
     let encoded = encode_sync_data_field_v1(unusual_key);
     assert!(!encoded.chars().any(char::is_control));
-    assert_eq!(decode_sync_data_field_v1(&encoded).as_deref(), Some(unusual_key));
+    assert_eq!(
+        decode_sync_data_field_v1(&encoded).as_deref(),
+        Some(unusual_key)
+    );
     assert_eq!(upsert.fields[&encoded], json!("private key name"));
 
     let correction = create_event_correction(
@@ -98,7 +224,10 @@ fn local_event_operations_preserve_origin_and_correction_scope() {
     assert_eq!(correction.fields.len(), 1);
     assert!(correction.fields.contains_key("data:title"));
     let merged = merge_operations(&[upsert.clone()], &[correction.clone()]).unwrap();
-    assert_eq!(merged.events[0].sync_bucket_id, URL_SAFE_NO_PAD.encode([0x66; 16]));
+    assert_eq!(
+        merged.events[0].sync_bucket_id,
+        URL_SAFE_NO_PAD.encode([0x66; 16])
+    );
 
     let tombstone = create_event_tombstone([2u8; 16], 3, origin, 42, [0x66; 16]).unwrap();
     assert_eq!(tombstone.kind, SyncOperationKindV1::Tombstone);
@@ -108,9 +237,24 @@ fn local_event_operations_preserve_origin_and_correction_scope() {
 #[test]
 fn merge_history_can_exceed_the_per_manifest_operation_limit() {
     let operations = (1..=10_001)
-        .map(|counter| event_op(1, counter, SyncOperationKindV1::Upsert, &[("title", json!("same"))]))
+        .map(|counter| {
+            event_op(
+                1,
+                counter,
+                SyncOperationKindV1::Upsert,
+                &[("title", json!("same"))],
+            )
+        })
         .collect::<Vec<_>>();
-    assert!(SyncManifestV1::new_signed(&signing_identity(1), [0x77; 16], 1, 1, [0; 32], operations.clone()).is_err());
+    assert!(SyncManifestV1::new_signed(
+        &signing_identity(1),
+        [0x77; 16],
+        1,
+        1,
+        [0; 32],
+        operations.clone()
+    )
+    .is_err());
 
     let merged = merge_operations(&[], &operations).unwrap();
 
@@ -140,13 +284,25 @@ fn counters_event_ids_and_revisions_fit_sqlite_integer_storage() {
     )
     .is_err());
     let writer = signing_identity(1);
-    assert!(SyncManifestV1::new_signed(&writer, [0x77; 16], 1, too_large, [0; 32], Vec::new()).is_err());
+    assert!(
+        SyncManifestV1::new_signed(&writer, [0x77; 16], 1, too_large, [0; 32], Vec::new()).is_err()
+    );
 }
 
 #[test]
 fn one_origin_event_cannot_be_assigned_to_two_sync_buckets() {
-    let upsert = event_op(1, 1, SyncOperationKindV1::Upsert, &[("app", json!("Editor"))]);
-    let mut correction = event_op(2, 1, SyncOperationKindV1::Correction, &[("app", json!("Other"))]);
+    let upsert = event_op(
+        1,
+        1,
+        SyncOperationKindV1::Upsert,
+        &[("app", json!("Editor"))],
+    );
+    let mut correction = event_op(
+        2,
+        1,
+        SyncOperationKindV1::Correction,
+        &[("app", json!("Other"))],
+    );
     correction.sync_bucket_id = Some(URL_SAFE_NO_PAD.encode([0x67; 16]));
 
     assert!(matches!(
@@ -157,8 +313,18 @@ fn one_origin_event_cannot_be_assigned_to_two_sync_buckets() {
 
 #[test]
 fn one_sync_bucket_cannot_change_its_descriptor() {
-    let first = event_op(1, 1, SyncOperationKindV1::Upsert, &[("app", json!("Editor"))]);
-    let mut changed = event_op(2, 1, SyncOperationKindV1::Upsert, &[("app", json!("Editor"))]);
+    let first = event_op(
+        1,
+        1,
+        SyncOperationKindV1::Upsert,
+        &[("app", json!("Editor"))],
+    );
+    let mut changed = event_op(
+        2,
+        1,
+        SyncOperationKindV1::Upsert,
+        &[("app", json!("Editor"))],
+    );
     changed.bucket_descriptor.as_mut().unwrap().client = "OtherClient".into();
 
     assert!(matches!(
@@ -203,13 +369,22 @@ fn shared_merge_vectors_cover_replay_clock_skew_tombstones_and_policy_conflicts(
     )
     .unwrap();
     assert_eq!(manifest.head_hash, vectors["manifest"]["head_hash"]);
-    assert_eq!(manifest.signature, vectors["manifest"]["signature"].as_str().unwrap());
+    assert_eq!(
+        manifest.signature,
+        vectors["manifest"]["signature"].as_str().unwrap()
+    );
     assert_eq!(
         writer.public_identity().ed25519_public_key,
-        vectors["manifest"]["writer_signing_public_key"].as_str().unwrap()
+        vectors["manifest"]["writer_signing_public_key"]
+            .as_str()
+            .unwrap()
     );
-    manifest.verify_signature(&writer.public_identity(), &vault_id).unwrap();
-    assert!(manifest.verify_signature(&writer.public_identity(), &[0x18; 16]).is_err());
+    manifest
+        .verify_signature(&writer.public_identity(), &vault_id)
+        .unwrap();
+    assert!(manifest
+        .verify_signature(&writer.public_identity(), &[0x18; 16])
+        .is_err());
 
     for (name, vector) in vectors["cases"].as_object().unwrap() {
         let operations = vector["operations"]
@@ -219,7 +394,10 @@ fn shared_merge_vectors_cover_replay_clock_skew_tombstones_and_policy_conflicts(
             .map(|value| serde_json::from_value::<SyncOperationV1>(value.clone()).unwrap())
             .collect::<Vec<_>>();
         let merged = merge_operations(&operations, &operations).unwrap();
-        assert_eq!(merged.operations.len(), vector["expected"]["operation_count"]);
+        assert_eq!(
+            merged.operations.len(),
+            vector["expected"]["operation_count"]
+        );
 
         match name.as_str() {
             "clock_skew_duplicate_and_concurrent_fields" => {
@@ -228,19 +406,24 @@ fn shared_merge_vectors_cover_replay_clock_skew_tombstones_and_policy_conflicts(
                 assert_eq!(merged.events.len(), 1);
                 assert!(merged.events[0].fields == expected_fields);
                 assert_eq!(merged.events[0].deleted, vector["expected"]["deleted"]);
-                let mut actual = merged.conflicts.iter().map(|item| item.field.clone()).collect::<Vec<_>>();
+                let mut actual = merged
+                    .conflicts
+                    .iter()
+                    .map(|item| item.field.clone())
+                    .collect::<Vec<_>>();
                 actual.sort();
-                let expected: Vec<String> = serde_json::from_value(
-                    vector["expected"]["conflict_fields"].clone(),
-                )
-                .unwrap();
+                let expected: Vec<String> =
+                    serde_json::from_value(vector["expected"]["conflict_fields"].clone()).unwrap();
                 assert_eq!(actual, expected);
             }
             "tombstone_equal_counter" => {
                 assert_eq!(merged.events.len(), 1);
                 assert!(merged.events[0].deleted);
                 assert!(merged.events[0].fields.is_empty());
-                assert_eq!(merged.conflicts[0].field, vector["expected"]["tombstone_wins"]);
+                assert_eq!(
+                    merged.conflicts[0].field,
+                    vector["expected"]["tombstone_wins"]
+                );
                 assert!(merged.conflicts[0].winner_is_tombstone);
             }
             "same_device_sequential_edit" => {
@@ -252,14 +435,10 @@ fn shared_merge_vectors_cover_replay_clock_skew_tombstones_and_policy_conflicts(
             "policy_change_requires_local_choice" => {
                 assert!(merged.events.is_empty());
                 let pending = merged.pending_policy_conflict.unwrap();
-                let expected_devices: Vec<String> = serde_json::from_value(
-                    vector["expected"]["policy_devices"].clone(),
-                )
-                .unwrap();
-                let expected_versions: Vec<u64> = serde_json::from_value(
-                    vector["expected"]["policy_versions"].clone(),
-                )
-                .unwrap();
+                let expected_devices: Vec<String> =
+                    serde_json::from_value(vector["expected"]["policy_devices"].clone()).unwrap();
+                let expected_versions: Vec<u64> =
+                    serde_json::from_value(vector["expected"]["policy_versions"].clone()).unwrap();
                 assert_eq!(pending.devices, expected_devices);
                 assert_eq!(pending.versions, expected_versions);
                 let metadata = serde_json::to_string(&pending).unwrap();
@@ -310,11 +489,18 @@ fn encrypted_manifest_keeps_event_fields_inside_the_authenticated_chunk() {
     let decrypted = decrypt_manifest(&key, &envelope).unwrap();
     assert_eq!(decrypted.revision, manifest.revision);
     assert_eq!(decrypted.head_hash, manifest.head_hash);
-    assert_eq!(decrypted.operations[0].fields["title"], json!("SYNTHETIC_PRIVATE_EVENT_TITLE"));
-    decrypted.verify_signature(&writer.public_identity(), &[17u8; 16]).unwrap();
+    assert_eq!(
+        decrypted.operations[0].fields["title"],
+        json!("SYNTHETIC_PRIVATE_EVENT_TITLE")
+    );
+    decrypted
+        .verify_signature(&writer.public_identity(), &[17u8; 16])
+        .unwrap();
     let mut altered_signature = decrypted.clone();
     altered_signature.signature = URL_SAFE_NO_PAD.encode([0; 64]);
-    assert!(altered_signature.verify_signature(&writer.public_identity(), &[17u8; 16]).is_err());
+    assert!(altered_signature
+        .verify_signature(&writer.public_identity(), &[17u8; 16])
+        .is_err());
 
     let mut tampered = envelope;
     tampered.ciphertext = URL_SAFE_NO_PAD.encode([0u8; 160]);
@@ -323,8 +509,18 @@ fn encrypted_manifest_keeps_event_fields_inside_the_authenticated_chunk() {
 
 #[test]
 fn reusing_a_device_counter_for_different_content_is_rejected() {
-    let first = event_op(1, 7, SyncOperationKindV1::Correction, &[("app", json!("one"))]);
-    let fork = event_op(1, 7, SyncOperationKindV1::Correction, &[("app", json!("two"))]);
+    let first = event_op(
+        1,
+        7,
+        SyncOperationKindV1::Correction,
+        &[("app", json!("one"))],
+    );
+    let fork = event_op(
+        1,
+        7,
+        SyncOperationKindV1::Correction,
+        &[("app", json!("two"))],
+    );
     assert!(matches!(
         merge_operations(&[first], &[fork]),
         Err(MergeErrorV1::OperationFork)
@@ -337,7 +533,9 @@ fn tombstones_wait_for_every_active_device_but_removed_devices_no_longer_block_c
     let second = URL_SAFE_NO_PAD.encode([2u8; 16]);
     let removed = URL_SAFE_NO_PAD.encode([3u8; 16]);
     assert!(!tombstone_collectible(&[first.clone(), second.clone()], &[first.clone()]).unwrap());
-    assert!(tombstone_collectible(&[first.clone(), second.clone()], &[first, second, removed]).unwrap());
+    assert!(
+        tombstone_collectible(&[first.clone(), second.clone()], &[first, second, removed]).unwrap()
+    );
 }
 
 #[test]
@@ -345,7 +543,10 @@ fn pending_tombstone_ack_device_ids_lists_only_active_devices_without_acknowledg
     let active = [[1u8; 16], [2u8; 16], [3u8; 16]];
     let acknowledged = [[1u8; 16], [3u8; 16]];
 
-    assert_eq!(pending_tombstone_ack_device_ids(&active, &acknowledged), vec![[2u8; 16]]);
+    assert_eq!(
+        pending_tombstone_ack_device_ids(&active, &acknowledged),
+        vec![[2u8; 16]]
+    );
     assert!(pending_tombstone_ack_device_ids(&active, &active).is_empty());
 }
 
@@ -354,23 +555,64 @@ fn manifest_head_rejects_replay_rollback_fork_gap_and_wrong_parent() {
     let vector: Value =
         serde_json::from_str(include_str!("../test-vectors/sync-merge-v1.json")).unwrap();
     let expected = &vector["manifest_decisions"];
-    let operation = event_op(1, 1, SyncOperationKindV1::Upsert, &[("app", json!("Editor"))]);
+    let operation = event_op(
+        1,
+        1,
+        SyncOperationKindV1::Upsert,
+        &[("app", json!("Editor"))],
+    );
     let genesis = SyncHeadV1::genesis();
     let writer = signing_identity(1);
-    let first = SyncManifestV1::new_signed(&writer, [0x77; 16], 1, 1, [0; 32], vec![operation.clone()]).unwrap();
+    let first =
+        SyncManifestV1::new_signed(&writer, [0x77; 16], 1, 1, [0; 32], vec![operation.clone()])
+            .unwrap();
     let decision = first.advance(&genesis).unwrap();
     assert_eq!(manifest_outcome(Ok(decision)), expected["first_revision"]);
     let decision = first.advance(&genesis).unwrap();
-    let ManifestDecisionV1::Advanced(head) = decision else { panic!("expected head advance"); };
-    assert_eq!(manifest_outcome(first.advance(&head)), expected["exact_replay"]);
+    let ManifestDecisionV1::Advanced(head) = decision else {
+        panic!("expected head advance");
+    };
+    assert_eq!(
+        manifest_outcome(first.advance(&head)),
+        expected["exact_replay"]
+    );
 
-    let fork = SyncManifestV1::new_signed(&writer, [0x77; 16], 1, 1, [0; 32], vec![event_op(1, 2, SyncOperationKindV1::Correction, &[("app", json!("Other"))])]).unwrap();
-    assert_eq!(manifest_outcome(fork.advance(&head)), expected["same_revision_different_hash"]);
-    assert_eq!(manifest_outcome(first.advance(&SyncHeadV1::new(2, [7; 32]))), expected["lower_revision"]);
-    let wrong_parent = SyncManifestV1::new_signed(&writer, [0x77; 16], 1, 2, [8; 32], vec![operation.clone()]).unwrap();
-    assert_eq!(manifest_outcome(wrong_parent.advance(&head)), expected["wrong_parent"]);
-    let gap = SyncManifestV1::new_signed(&writer, [0x77; 16], 1, 3, head.head_hash, vec![operation]).unwrap();
-    assert_eq!(manifest_outcome(gap.advance(&head)), expected["revision_gap"]);
+    let fork = SyncManifestV1::new_signed(
+        &writer,
+        [0x77; 16],
+        1,
+        1,
+        [0; 32],
+        vec![event_op(
+            1,
+            2,
+            SyncOperationKindV1::Correction,
+            &[("app", json!("Other"))],
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        manifest_outcome(fork.advance(&head)),
+        expected["same_revision_different_hash"]
+    );
+    assert_eq!(
+        manifest_outcome(first.advance(&SyncHeadV1::new(2, [7; 32]))),
+        expected["lower_revision"]
+    );
+    let wrong_parent =
+        SyncManifestV1::new_signed(&writer, [0x77; 16], 1, 2, [8; 32], vec![operation.clone()])
+            .unwrap();
+    assert_eq!(
+        manifest_outcome(wrong_parent.advance(&head)),
+        expected["wrong_parent"]
+    );
+    let gap =
+        SyncManifestV1::new_signed(&writer, [0x77; 16], 1, 3, head.head_hash, vec![operation])
+            .unwrap();
+    assert_eq!(
+        manifest_outcome(gap.advance(&head)),
+        expected["revision_gap"]
+    );
 }
 
 #[test]
@@ -394,11 +636,19 @@ fn signed_manifest_binds_and_canonicalizes_tombstone_acknowledgements() {
         [0; 32],
         Vec::new(),
         vec![second.clone(), first.clone()],
-    ).unwrap();
-    assert_eq!(manifest.tombstone_acknowledgements, vec![first.clone(), second]);
-    manifest.verify_signature(&writer.public_identity(), &[0x73; 16]).unwrap();
+    )
+    .unwrap();
+    assert_eq!(
+        manifest.tombstone_acknowledgements,
+        vec![first.clone(), second]
+    );
+    manifest
+        .verify_signature(&writer.public_identity(), &[0x73; 16])
+        .unwrap();
 
     let mut altered = manifest;
     altered.tombstone_acknowledgements[0].tombstone_counter += 1;
-    assert!(altered.verify_signature(&writer.public_identity(), &[0x73; 16]).is_err());
+    assert!(altered
+        .verify_signature(&writer.public_identity(), &[0x73; 16])
+        .is_err());
 }

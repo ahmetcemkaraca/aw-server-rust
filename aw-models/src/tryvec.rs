@@ -71,6 +71,10 @@ impl<T: JsonSchema> TryVec<T> {
         (vec, skipped)
     }
 
+    pub fn has_unparsed(&self) -> bool {
+        self.inner.iter().any(|item| !matches!(item, TryParse::Parsed(_)))
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.inner.iter().filter_map(|item| match item {
             TryParse::Parsed(value) => Some(value),
@@ -226,6 +230,8 @@ mod test {
     #[test]
     fn take_inner_reports_unparsed_events_as_skipped() {
         let tryvec = serde_json::from_str::<TryVec<TestEvent>>(r#"[{"data":"kept"},{"data":2}]"#).unwrap();
+        assert!(tryvec.has_unparsed());
+        assert!(!TryVec::new(vec![TestEvent {data:"valid".into()}]).has_unparsed());
         let (events, skipped) = tryvec.take_inner_with_skipped();
         assert_eq!(events.len(), 1);
         assert_eq!(skipped, 1);

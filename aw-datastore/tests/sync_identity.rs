@@ -23,6 +23,54 @@ fn snapshot(epoch: u64, vault_id: [u8; 16], id: u8) -> SyncSnapshotV1 {
 }
 
 #[test]
+fn recovery_replaces_pre_sync_identity_atomically_and_rolls_back_trigger_failure() {
+    let path = std::env::temp_dir().join(format!("peak-recovery-identity-{}-{}.db",std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let secret = "b".repeat(64);
+    let store = Datastore::open_encrypted(path.to_string_lossy().into_owned(),secret.clone()).unwrap();
+    store.enable_capture_policy().unwrap(); store.pause_capture().unwrap();
+    let original = SyncDeviceIdentity::new([0x21;16],Zeroizing::new([0x31;32]),Zeroizing::new([0x41;32]));
+    let recovered = SyncDeviceIdentity::new([0x22;16],Zeroizing::new([0x32;32]),Zeroizing::new([0x42;32]));
+    store.create_sync_device_identity(&original).unwrap();
+    let state = aw_datastore::SyncRecoveryStateV1 {
+        schema_version:1, key_epoch:1, baseline_complete:false, bucket_mappings:vec![], event_mappings:vec![],
+        trusted_devices:vec![], operations:vec![], stream_heads:vec![], counters:vec![], tombstone_acknowledgements:vec![], backup_deletions:vec![], policy:None,
+    };
+    store.close();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.pragma_update(None,"key",secret.as_str()).unwrap();
+    connection.execute_batch("CREATE TRIGGER reject_recovered_identity BEFORE INSERT ON sync_device_identity BEGIN SELECT RAISE(ABORT,'synthetic recovery failure'); END;").unwrap();
+    drop(connection);
+    let store = Datastore::open_encrypted(path.to_string_lossy().into_owned(),secret.clone()).unwrap();
+    store.set_key_value("recovery-test-initialized","ready").unwrap();
+    store.set_key_value("ios_manual_source_checkpoint_v1","stale local ownership").unwrap();
+    let material = SyncKeyMaterial::new(Zeroizing::new([0x51;32]),[0x61;16],1,[0x71;24],[0x81;48]);
+    let encrypted = snapshot(1,[0x61;16],0x91);
+    assert!(store.restore_sync_recovery_data(BucketsExport{buckets:HashMap::new()},material.clone(),encrypted.clone(),state.clone(),recovered.clone()).is_err());
+    let retained = store.load_sync_device_identity().unwrap().unwrap();
+    assert_eq!(retained.device_id(),original.device_id());
+    assert!(retained.private_key() == original.private_key());
+    assert!(store.load_sync_key_material().unwrap().is_none());
+    assert!(store.load_sync_snapshot().unwrap().is_none());
+    assert!(store.get_buckets().unwrap().is_empty());
+    assert_eq!(store.get_key_value("ios_manual_source_checkpoint_v1").unwrap(),"stale local ownership");
+    store.close();
+    assert!(!std::fs::read(&path).unwrap().starts_with(b"SQLite format 3"));
+    aw_datastore::vault::verify(&path,&secret).unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.pragma_update(None,"key",secret.as_str()).unwrap();
+    connection.execute_batch("DROP TRIGGER reject_recovered_identity;").unwrap(); drop(connection);
+    let store = Datastore::open_encrypted(path.to_string_lossy().into_owned(),secret.clone()).unwrap();
+    store.restore_sync_recovery_data(BucketsExport{buckets:HashMap::new()},material,encrypted,state,recovered.clone()).unwrap();
+    store.close();
+    let reopened = Datastore::open_encrypted(path.to_string_lossy().into_owned(),secret).unwrap();
+    assert_eq!(reopened.load_sync_device_identity().unwrap().unwrap().device_id(),recovered.device_id());
+    assert!(reopened.load_sync_key_material().unwrap().is_some());
+    assert!(reopened.get_key_value("ios_manual_source_checkpoint_v1").is_err());
+    reopened.close(); std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn sync_device_identity_is_persisted_once_and_survives_reopen() {
     let path = std::env::temp_dir().join(format!(
         "peakactivity-sync-identity-{}.db",

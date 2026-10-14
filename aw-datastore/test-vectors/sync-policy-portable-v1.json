@@ -1,0 +1,37 @@
+[
+  {
+    "field": "egress.user_policy",
+    "portable_json": "{\"schema_version\": 1, \"present\": true, \"value\": {\"schema_version\": 1, \"user_rules\": [[[\"keyword\", \"banking\"], \"deny\"]], \"safe_zone_patterns\": [], \"after_hours\": [[1], 0, 60]}}",
+    "accepted": true
+  },
+  {
+    "field": "egress.user_policy",
+    "portable_json": "{\"schema_version\":1,\"present\":true,\"value\":{\"schema_version\":1,\"user_rules\":[],\"safe_zone_patterns\":[]}}",
+    "accepted": true
+  },
+  {
+    "field": "egress.signed_bundle",
+    "portable_json": "{\"schema_version\": 1, \"present\": true, \"value\": {\"schema_version\": 1, \"signer_key_id\": \"synthetic\", \"signature\": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], \"bundle\": {\"schema_version\": 1, \"version\": 3, \"hard_deny_version\": 1, \"destinations\": [{\"id\": \"planned\", \"status\": \"planned\", \"allowed_purposes\": []}], \"purposes\": [], \"organization_rules\": []}}}",
+    "accepted": true
+  },
+  {
+    "field": "settings.privacy_filters",
+    "portable_json": "{\"schema_version\":1,\"present\":true,\"value\":[[true,null,\"\",\"\",\"drop\",null]]}",
+    "accepted": true
+  },
+  {
+    "field": "settings.privacy_filters",
+    "portable_json": "{\"schema_version\":1,\"present\":true,\"value\":[{\"enabled\":true,\"field\":\"\",\"pattern\":\"\",\"action\":\"drop\"}]}",
+    "accepted": true
+  },
+  {
+    "field": "settings.rawRetentionDays",
+    "portable_json": "{\"schema_version\":1,\"present\":true,\"value\":1.0}",
+    "accepted": false
+  },
+  {
+    "field": "settings.privacy_filters",
+    "portable_json": "{\"schema_version\":1,\"present\":true,\"value\":[{\"enabled\":true,\"pattern\":\"\",\"action\":\"drop\"}]}",
+    "accepted": false
+  }
+]

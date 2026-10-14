@@ -1,136 +1,66 @@
-name: Build
+name: Core critical checks
 
 on:
-  push:
-    branches: [ master ]
   pull_request:
-    branches: [ master ]
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macOS-latest]
-
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      AW_WEBUI_DIR: ${{ github.workspace }}/aw-webui/dist
+      EXPECTED_WEBUI_REV: 9ab60a2cc406102749fbe53cb760d4f817fe7711
     steps:
-    - uses: actions/checkout@v7
-    - name: Set up Rust
-      id: toolchain
-      uses: dtolnay/rust-toolchain@stable
-    - name: Cache cargo build
-      uses: actions/cache@v6
-      if: runner.os != 'macOS'  # cache doesn't seem to behave nicely on macOS, see: https://github.com/ActivityWatch/aw-server-rust/issues/180
-      env:
-        cache-name: cargo-build-target
-      with:
-        path: target
-        # key needs to contain cachekey due to https://github.com/ActivityWatch/aw-server-rust/issues/180
-        key: ${{ runner.os }}-${{ env.cache-name }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-${{ env.cache-name }}-${{ steps.toolchain.outputs.cachekey }}-
-    - name: Build
-      run: cargo build --workspace --verbose
-    - name: Run tests
-      run: cargo test --workspace --verbose
-    - uses: actions/upload-artifact@v7
-      with:
-        # TODO: These binaries are debug builds
-        name: binaries-${{runner.os}}
-        path: |
-          target/*/aw-server
-          target/*/aw-server.exe
-          target/*/aw-sync
-          target/*/aw-sync.exe
-
-  build-android:
-    name: Android
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v7
-    - name: Verify Android build script cwd handling
-      run: bash ./scripts/test-compile-android-cwd.sh
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@stable
-    - name: Cache cargo build
-      uses: actions/cache@v6
-      env:
-        cache-name: cargo-build-target-android
-      with:
-        path: target
-        key: ${{ runner.os }}-${{ env.cache-name }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-${{ env.cache-name }}-
-    - name: Build
-      run: |
-        export ANDROID_NDK_HOME=   # needed because GitHub Actions sets it by default...
-        make android
-    - uses: actions/upload-artifact@v7
-      with:
-        # TODO: These binaries are debug builds
-        name: binaries-android
-        path: |
-          target/*/*/libaw_server.so
-
-  # Code coverage using tarpaulin
-  # Works better than grcov, but not as many fancy features (no branch coverage, no LLVM)
-  # See: https://shift.click/blog/github-actions-rust/#code-coverage
-  build-coverage-tarpaulin:
-    name: Code coverage
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v7
-    - name: Set up Rust
-      uses: dtolnay/rust-toolchain@stable
-
-    # Note: If you need to combine the coverage info of multiple
-    # feature sets, you need a `.tarpaulin.toml` config file, see
-    # the link above for those docs.
-    - name: Install cargo-tarpaulin
-      run: cargo install cargo-tarpaulin
-
-    - name: Run tests with coverage
-      run: cargo tarpaulin --out Xml
-
-    # Note: closed-source code needs to provide a token,
-    # but open source code does not.
-    - name: Upload to codecov.io
-      uses: codecov/codecov-action@v7
-
-  # Code coverage using grcov
-  #build-coverage-grcov:
-  #  name: Build with coverage
-  #  runs-on: ubuntu-latest
-
-  #  steps:
-  #  - uses: actions/checkout@v7
-  #  - name: Set up Rust nightly
-  #    uses: actions-rs/toolchain@v1
-  #    with:
-  #      profile: minimal
-  #      toolchain: nightly
-  #      override: true
-  #  - name: Cache cargo build
-  #    uses: actions/cache@v6
-  #    env:
-  #      cache-name: cargo-build-target-coverage
-  #    with:
-  #      path: target
-  #      key: ${{ runner.os }}-${{ env.cache-name }}-${{ hashFiles('**/Cargo.lock') }}
-  #      restore-keys: |
-  #        ${{ runner.os }}-${{ env.cache-name }}-
-  #  - name:  Install llvm-tools
-  #    run: |
-  #      rustup component add llvm-tools-preview
-  #  - name: Download grcov
-  #    run: |
-  #      curl -L https://github.com/mozilla/grcov/releases/latest/download/grcov-x86_64-unknown-linux-gnu.tar.bz2  | tar jxf -
-  #  - name: Run tests with coverage
-  #    run: |
-  #      # Add cwd to path to find grcov
-  #      export PATH=$PATH:.
-  #      make coverage-lcov COVERAGE_CACHE=1
-  #  - name: Upload coverage files
-  #    run: bash <(curl -s https://codecov.io/bash) -f target/debug/lcov.info;
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify reviewed dependency source
+        run: |
+          test "$(git rev-parse HEAD:aw-webui)" = "$EXPECTED_WEBUI_REV"
+          test "$(git -C aw-webui rev-parse HEAD)" = "$EXPECTED_WEBUI_REV"
+          git submodule status --recursive
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '24.20.0'
+          package-manager-cache: false
+      - name: Install reviewed Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --no-self-update
+      - name: Build real embedded WebUI assets
+        run: |
+          npm ci --prefix aw-webui --no-audit --no-fund
+          make -C aw-webui build
+          test -s "$AW_WEBUI_DIR/index.html"
+          test -s "$AW_WEBUI_DIR/peakactivity.svg"
+          test -s "$AW_WEBUI_DIR/LICENSE.txt"
+      - name: Build encrypted server with plugin runtime
+        run: cargo +1.98.1 build --locked -p aw-server --bin aw-server --no-default-features --features encryption,plugin-runtime
+      - name: Check real Wasmtime limits and sample ABI
+        run: |
+          cargo +1.98.1 test --locked -p aw-plugin-runtime --lib wasm_ -- --test-threads=1
+          cargo +1.98.1 test --locked -p aw-plugin-runtime --lib checked_in_noop_sample_uses_the_v1_core_module_abi -- --test-threads=1
+      - name: Check encrypted plugin storage and scoped approval routes
+        run: |
+          cargo +1.98.1 test --locked -p aw-datastore --no-default-features --features encryption --test plugin_storage --test plugin_events -- --test-threads=1
+          cargo +1.98.1 test --locked -p aw-server --no-default-features --features encryption,plugin-runtime,companion --test plugin_routes --test companion_bridge -- --test-threads=1
+      - name: Check closed plugin schema and vectors
+        run: |
+          python3 -m venv "$RUNNER_TEMP/plugin-schema"
+          "$RUNNER_TEMP/plugin-schema/bin/python" -m pip install --disable-pip-version-check jsonschema==4.19.2
+          "$RUNNER_TEMP/plugin-schema/bin/python" -m unittest scripts.tests.test_plugin_boundary.PluginBoundaryTest.test_manifest_schema_and_synthetic_vectors_are_strict scripts.tests.test_plugin_boundary.PluginBoundaryTest.test_plugin_annotation_write_schema_is_closed_and_bounded
+          cargo +1.98.1 test --locked -p aw-models --test plugin_contract plugin_write_intents_require_a_registered_closed_schema -- --test-threads=1
+      - name: Check dependency locks are unchanged
+        run: |
+          git diff --exit-code -- Cargo.lock
+          git -C aw-webui diff --exit-code -- package-lock.json

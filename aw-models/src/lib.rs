@@ -27,8 +27,11 @@ mod freelancer;
 mod info;
 mod plugin;
 mod query;
+mod query_control;
+mod reports;
 mod settings;
 mod sync;
+mod sync_policy;
 mod timeinterval;
 mod tryvec;
 
@@ -45,6 +48,7 @@ pub use self::ai::{
 pub use self::bucket::BucketsExport;
 pub use self::event::Event;
 pub use self::freelancer::{
+    FREELANCER_TIMESHEET_EGRESS_PURPOSE_V1,
     calculate_invoice_subtotal_minor, freelancer_report_signature_message_v1,
     round_freelancer_duration,
     ApprovedTimesheetContractErrorV1, ApprovedTimesheetV1,
@@ -93,6 +97,9 @@ pub use self::plugin::{
     PLUGIN_SCHEMA_VERSION_V1,
 };
 pub use self::query::Query;
+pub use self::query_control::{QueryControl, QueryLimits, ReportControlStatsV1, ReportExecutionErrorV1, ReportFeatureAccessV1};
+pub use self::reports::*;
+pub use self::sync_policy::*;
 pub use self::settings::Settings;
 pub use self::settings::{
     Class, ClassData, ClassRule, NewReleaseCheckData, UserSatisfactionPollData, View, ViewElement,
@@ -108,3 +115,6 @@ pub use self::sync::{
 };
 pub use self::timeinterval::TimeInterval;
 pub use self::tryvec::TryVec;
+
+mod sync_backup;
+pub use sync_backup::{SnapshotDeletionFactV1,SnapshotDeletionObjectV1,BackupForgetFragmentV1,BACKUP_FORGET_OBJECTS_PER_FRAGMENT};

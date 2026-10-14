@@ -8,7 +8,11 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 fn package(version: &str, writes: bool) -> (SignedPluginPackageV1, Vec<u8>) {
-    let output = json!({"schema_version":1,"ui":[],"writes":if writes {vec![json!({"event_type":"plugin.annotation","schema_id":"annotation-v1","payload":{"title":"Review","body":"Synthetic annotation"}})]} else {vec![]},"network":[],"ai":[],"storage":[],"destructive":[]}).to_string();
+    signed_package(version, PluginCapabilitiesV1 { write: if writes { vec![PluginWriteCapabilityV1 { event_type:"plugin.annotation".into(), schema_id:"annotation-v1".into() }] } else {vec![]}, ..Default::default() },
+        json!({"schema_version":1,"ui":[],"writes":if writes {vec![json!({"event_type":"plugin.annotation","schema_id":"annotation-v1","payload":{"title":"Review","body":"Synthetic annotation"}})]} else {vec![]},"network":[],"ai":[],"storage":[],"destructive":[]}))
+}
+fn signed_package(version: &str, capabilities: PluginCapabilitiesV1, output: Value) -> (SignedPluginPackageV1, Vec<u8>) {
+    let output = output.to_string();
     let escaped = output.bytes().map(|b| format!("\\{b:02x}")).collect::<String>();
     let packed = (output.len() as u64) << 32;
     let module = wat::parse_str(format!(r#"(module (memory (export "memory") 1 4)
@@ -21,12 +25,108 @@ fn package(version: &str, writes: bool) -> (SignedPluginPackageV1, Vec<u8>) {
         manifest: PluginManifestV1 {
             schema_version:1, plugin_id:"test-plugin".into(), version:version.into(), publisher_key_id:"test-publisher".into(),
             display_name:"Synthetic test plugin".into(), description:"Not a release package".into(),
-            capabilities: PluginCapabilitiesV1 { write: if writes { vec![PluginWriteCapabilityV1 { event_type:"plugin.annotation".into(), schema_id:"annotation-v1".into() }] } else {vec![]}, ..Default::default() },
+            capabilities,
         },
         module_sha256: digest(&SHA256, &module).as_ref().iter().map(|b|format!("{b:02x}")).collect(), signature:vec![0;64],
     };
     package.signature = signer.sign(&plugin_package_signing_bytes_v1(&package).unwrap()).as_ref().to_vec();
     (package, module)
+}
+#[test]
+fn scoped_actions_require_current_snapshot_consent_and_single_use_confirmation() {
+    use aw_models::{PluginDestructiveActionV1, PluginDestructiveCapabilityV1, PluginStorageCapabilityV1, PluginStorageIntentV1, PluginWriteIntentV1};
+    let (package,module)=signed_package("2.0.0", PluginCapabilitiesV1 {
+        storage:Some(PluginStorageCapabilityV1 {quota_bytes:4096,encrypted:true}),
+        write:vec![PluginWriteCapabilityV1 {event_type:"plugin.annotation".into(),schema_id:"annotation-v1".into()}],
+        destructive:vec![PluginDestructiveCapabilityV1 {action:PluginDestructiveActionV1::Export,confirmation_required:true}, PluginDestructiveCapabilityV1 {action:PluginDestructiveActionV1::Delete,confirmation_required:true}],
+        ..Default::default()
+    },json!({"schema_version":1,"ui":[],"writes":[],"network":[],"ai":[],"storage":[],"destructive":[{"action":"export","resource_id":"plugin_owned_data"},{"action":"delete","resource_id":"plugin_owned_data"}]}));
+    let (client,store,admin,read)=setup(&[&package],true);
+    let installed=expect(&client,&admin,Method::Post,"/install",json!({"package":package,"module_bytes":module}),Status::Ok);
+    let hash=installed["package_sha256"].as_str().unwrap();
+    expect(&client,&admin,Method::Post,"/test-plugin/consent",json!({"package_sha256":hash,"confirmed":true}),Status::Ok);
+    store.apply_plugin_storage_intents(&package.manifest,&[PluginStorageIntentV1 {key:"cache".into(),value:Some(json!({"count":1}))}]).unwrap();
+    store.apply_plugin_write_intents(&package.manifest,&[PluginWriteIntentV1 {event_type:"plugin.annotation".into(),schema_id:"annotation-v1".into(),payload:json!({"title":"Owned","body":"Local plugin annotation"})}]).unwrap();
+    let other=PluginManifestV1 {plugin_id:"other-plugin".into(),..package.manifest.clone()};
+    store.apply_plugin_storage_intents(&other,&[PluginStorageIntentV1 {key:"cache".into(),value:Some(json!("preserved"))}]).unwrap();
+    let invoked=expect(&client,&admin,Method::Post,"/test-plugin/invoke",json!({"package_sha256":hash}),Status::Ok);
+    assert_eq!(invoked["destructive_confirmations"][0]["storage_keys"],1);
+    assert_eq!(invoked["destructive_confirmations"][0]["event_count"],1);
+    assert_eq!(store.get_plugin_storage(&package.manifest).unwrap().len(),1);
+    expect(&client,&read,Method::Get,"/test-plugin/pending",Value::Null,Status::Forbidden);
+    let pending=expect(&client,&admin,Method::Get,"/test-plugin/pending",Value::Null,Status::Ok);
+    assert_eq!(pending["invocations"][0]["invocation_id"],invoked["invocation_id"]);
+    let mut approval=json!({"package_sha256":hash,"invocation_id":invoked["invocation_id"],"action_index":0,"confirmed":false});
+    expect(&client,&admin,Method::Post,"/test-plugin/actions/approve",approval.clone(),Status::BadRequest);
+    approval["confirmed"]=json!(true);
+    expect(&client,&read,Method::Post,"/test-plugin/actions/approve",approval.clone(),Status::Forbidden);
+    let exported=expect(&client,&admin,Method::Post,"/test-plugin/actions/approve",approval.clone(),Status::Ok);
+    assert_eq!(exported["data"]["storage"]["cache"]["count"],1);
+    expect(&client,&admin,Method::Post,"/test-plugin/actions/approve",approval.clone(),Status::Conflict);
+    store.apply_plugin_storage_intents(&package.manifest,&[PluginStorageIntentV1 {key:"cache".into(),value:Some(json!({"count":2}))}]).unwrap();
+    approval["action_index"]=json!(1);
+    expect(&client,&admin,Method::Post,"/test-plugin/actions/approve",approval,Status::Conflict);
+    let invoked=expect(&client,&admin,Method::Post,"/test-plugin/invoke",json!({"package_sha256":hash}),Status::Ok);
+    let deleted=expect(&client,&admin,Method::Post,"/test-plugin/actions/approve",json!({"package_sha256":hash,"invocation_id":invoked["invocation_id"],"action_index":1,"confirmed":true}),Status::Ok);
+    assert_eq!(deleted["action"],"delete");
+    assert!(store.get_plugin_storage(&package.manifest).unwrap().is_empty());
+    assert!(store.get_plugin_events(&package.manifest).unwrap().is_empty());
+    assert_eq!(store.get_plugin_storage(&other).unwrap()["cache"],json!("preserved"));
+    expect(&client,&admin,Method::Post,"/test-plugin/revoke",json!({"package_sha256":hash,"confirmed":true}),Status::Ok);
+    expect(&client,&admin,Method::Get,"/test-plugin/pending",Value::Null,Status::Conflict);
+}
+#[test]
+fn background_tick_persists_interval_and_queues_effects_without_applying_them() {
+    use aw_models::{PluginBackgroundCapabilityV1, PluginUISurfaceV1};
+    let (package,module)=signed_package("3.0.0",PluginCapabilitiesV1 {
+        write:vec![PluginWriteCapabilityV1 {event_type:"plugin.annotation".into(),schema_id:"annotation-v1".into()}],
+        ui:vec![PluginUISurfaceV1::SettingsPanel],
+        background:Some(PluginBackgroundCapabilityV1 {minimum_interval_seconds:900,maximum_runtime_ms:1000,maximum_memory_bytes:262144}),
+        ..Default::default()
+    },json!({"schema_version":1,"ui":[{"surface":"settings_panel","title":"Background result","text":"Review the background result"}],"writes":[{"event_type":"plugin.annotation","schema_id":"annotation-v1","payload":{"title":"Background","body":"Explicit review required"}}],"network":[],"ai":[],"storage":[],"destructive":[]}));
+    let (client,store,admin,_)=setup(&[&package],true);
+    let installed=expect(&client,&admin,Method::Post,"/install",json!({"package":package,"module_bytes":module}),Status::Ok);
+    let hash=installed["package_sha256"].as_str().unwrap();
+    let trust=client.rocket().state::<PluginTrust>().unwrap();
+    let policy=client.rocket().state::<EgressPolicyTrust>().unwrap();
+    let proxy=client.rocket().state::<aw_egress::EgressProxy>().unwrap();
+    let now=chrono::Utc::now();
+    assert_eq!(endpoints::run_plugin_background(&store,true,trust,policy,proxy,now),0);
+    expect(&client,&admin,Method::Post,"/test-plugin/consent",json!({"package_sha256":hash,"confirmed":true}),Status::Ok);
+    assert_eq!(endpoints::run_plugin_background(&store,false,trust,policy,proxy,now),0);
+    assert_eq!(endpoints::run_plugin_background(&store,true,&PluginTrust::default(),policy,proxy,now),0);
+    assert_eq!(endpoints::run_plugin_background(&store,true,trust,policy,proxy,now),1);
+    assert!(store.get_plugin_events(&package.manifest).unwrap().is_empty());
+    let pending=expect(&client,&admin,Method::Get,"/test-plugin/pending",Value::Null,Status::Ok);
+    assert_eq!(pending["invocations"].as_array().unwrap().len(),1);
+    assert_eq!(pending["invocations"][0]["background"],true);
+    assert_eq!(pending["invocations"][0]["ui"][0]["text"],"Review the background result");
+    assert_eq!(endpoints::run_plugin_background(&store,true,trust,policy,proxy,now+chrono::Duration::seconds(899)),0);
+    let installed=expect(&client,&admin,Method::Get,"/installed",Value::Null,Status::Ok);
+    assert_eq!(installed["plugins"][0]["last_background_run_at"],json!(now.to_rfc3339()));
+    assert_eq!(endpoints::run_plugin_background(&store,true,trust,policy,proxy,now+chrono::Duration::seconds(900)),1);
+    let pending=expect(&client,&admin,Method::Get,"/test-plugin/pending",Value::Null,Status::Ok);
+    assert_eq!(pending["invocations"].as_array().unwrap().len(),2);
+    expect(&client,&admin,Method::Post,"/test-plugin/revoke",json!({"package_sha256":hash,"confirmed":true}),Status::Ok);
+    assert_eq!(endpoints::run_plugin_background(&store,true,trust,policy,proxy,now+chrono::Duration::hours(1)),0);
+    store.lock().unwrap();
+    assert_eq!(endpoints::run_plugin_background(&store,true,trust,policy,proxy,now+chrono::Duration::hours(1)),0);
+}
+#[test]
+fn destructive_vault_targets_are_rejected_before_any_action_is_queued() {
+    use aw_models::{PluginDestructiveActionV1, PluginDestructiveCapabilityV1};
+    let (package,module)=signed_package("4.0.0",PluginCapabilitiesV1 {
+        destructive:vec![PluginDestructiveCapabilityV1 {action:PluginDestructiveActionV1::Delete,confirmation_required:true}],
+        ..Default::default()
+    },json!({"schema_version":1,"ui":[],"writes":[],"network":[],"ai":[],"storage":[],"destructive":[{"action":"delete","resource_id":"vault"}]}));
+    let (client,store,admin,_)=setup(&[&package],true);
+    let installed=expect(&client,&admin,Method::Post,"/install",json!({"package":package,"module_bytes":module}),Status::Ok);
+    let hash=installed["package_sha256"].as_str().unwrap();
+    expect(&client,&admin,Method::Post,"/test-plugin/consent",json!({"package_sha256":hash,"confirmed":true}),Status::Ok);
+    expect(&client,&admin,Method::Post,"/test-plugin/invoke",json!({"package_sha256":hash}),Status::UnprocessableEntity);
+    let pending=expect(&client,&admin,Method::Get,"/test-plugin/pending",Value::Null,Status::Ok);
+    assert!(pending["invocations"].as_array().unwrap().is_empty());
+    assert!(store.get_plugin_events(&package.manifest).unwrap().is_empty());
 }
 fn setup(packages: &[&SignedPluginPackageV1], release_ready: bool) -> (Client, Datastore, String, String) {
     let store = Datastore::open_encrypted(":memory:".into(), "plugin-route-test-key".repeat(3)).unwrap();

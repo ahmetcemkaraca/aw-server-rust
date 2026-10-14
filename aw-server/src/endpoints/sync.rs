@@ -1,6 +1,6 @@
-use aw_datastore::{DatastoreError, SyncBaselineProgressV1, SyncTombstoneIdentityV1};
+use aw_datastore::{Datastore, DatastoreError, SyncBaselineProgressV1, SyncTombstoneIdentityV1};
 use aw_egress::{EgressProxy, EgressSyncRelayTransportV1};
-use aw_models::{SyncEnvelopeV1, SYNC_EGRESS_PURPOSE_V1};
+use aw_models::{EgressPolicyV1, EgressDestinationStatusV1, SyncEnvelopeV1, SYNC_EGRESS_PURPOSE_V1};
 use aw_sync_e2ee::{
     SyncHttpObjectStoreV1, SyncObjectStoreErrorV1, SyncObjectStoreV1,
     SyncRelayRequestV1, SyncRelayResponseV1, SyncTombstoneAckProofV1,
@@ -21,9 +21,9 @@ use crate::sync_control::SyncControl;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncEgressControlRequest {
-    enabled: bool,
-    destination_id: Option<String>,
-    purpose_id: Option<String>,
+    pub(crate) enabled: bool,
+    pub(crate) destination_id: Option<String>,
+    pub(crate) purpose_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -179,136 +179,135 @@ pub async fn history(
         .map_err(|_| HttpErrorJson::new(Status::ServiceUnavailable, "Sync object history is unavailable.".into()))?
 }
 
+pub(crate) fn local_sync_status(datastore: &Datastore) -> Result<SyncEgressControlResponse, HttpErrorJson> {
+    let consent = datastore.sync_egress_consent().map_err(HttpErrorJson::from)?;
+    let baseline = datastore.sync_baseline_progress().map_err(HttpErrorJson::from)?;
+    Ok(SyncEgressControlResponse {
+        enabled: consent.is_some(),
+        destination_id: consent.as_ref().map(|value| value.destination_id.clone()),
+        purpose_id: consent.map(|value| value.purpose_id),
+        preparing: baseline.as_ref().is_some_and(|progress| !progress.complete),
+        baseline,
+    })
+}
+
+fn sync_destination_available(policy: &EgressPolicyV1, destination_id: &str, purpose_id: &str) -> bool {
+    purpose_id == SYNC_EGRESS_PURPOSE_V1
+        && policy.purposes.iter().any(|purpose| purpose.id == purpose_id && purpose.destination_id == destination_id)
+        && policy.destinations.iter().any(|destination| destination.id == destination_id
+            && matches!(destination.status, EgressDestinationStatusV1::Available
+                | EgressDestinationStatusV1::Beta | EgressDestinationStatusV1::Experimental))
+}
+
+pub(crate) fn run_local_sync(
+    datastore: &Datastore, trust: &EgressPolicyTrust, proxy: &EgressProxy,
+) -> Result<Value, (HttpErrorJson, bool)> {
+    let denied = |message: &str| (HttpErrorJson::new(Status::Forbidden, message.into()), false);
+    proxy.require_sync_access(Utc::now()).map_err(|_| denied("A current signed paid sync entitlement is required."))?;
+    if !proxy.sync_enabled().map_err(|_| denied("Network sync is not enabled by local consent."))? {
+        return Err(denied("Network sync is not enabled by local consent."));
+    }
+    let consent = datastore.sync_egress_consent().map_err(|error| (HttpErrorJson::from(error), false))?
+        .ok_or_else(|| denied("No signed sync destination is selected."))?;
+    let policy = super::egress::active_policy(datastore, trust)
+        .map_err(|_| denied("The signed sync policy is unavailable or untrusted."))?;
+    if !sync_destination_available(policy.policy(), &consent.destination_id, &consent.purpose_id) {
+        return Err(denied("Sync is not permitted by the active signed policy."));
+    }
+    let transport = EgressSyncRelayTransportV1::new(proxy.clone(), policy);
+    let remote = SyncHttpObjectStoreV1::new(consent.destination_id, consent.purpose_id, transport)
+        .map_err(|_| denied("The signed sync destination is invalid."))?;
+    SyncControl::new().sync_operations(datastore, &remote).map_err(|error| (
+        HttpErrorJson::new(if error.retryable { Status::ServiceUnavailable } else { Status::Conflict },
+            "Encrypted sync did not complete; local operation data remains in the encrypted vault.".into()),
+        error.retryable,
+    ))
+}
+
+pub(crate) fn set_local_sync_enabled(
+    datastore: &Datastore, trust: &EgressPolicyTrust, proxy: &EgressProxy,
+    request: &SyncEgressControlRequest, create_snapshot: bool,
+) -> Result<SyncEgressControlResponse, HttpErrorJson> {
+    if !request.enabled {
+        proxy.set_sync_enabled(false, None, None)
+            .map_err(|_| HttpErrorJson::new(Status::Forbidden, "Sync remains unavailable under the current privacy controls.".into()))?;
+        return local_sync_status(datastore);
+    }
+    proxy.require_sync_access(Utc::now())
+        .map_err(|_| HttpErrorJson::new(Status::Forbidden, "A current signed paid sync entitlement is required.".into()))?;
+    let destination_id = request.destination_id.as_deref().ok_or_else(|| {
+        HttpErrorJson::new(Status::BadRequest, "Select a signed sync destination.".into())
+    })?;
+    let purpose_id = request.purpose_id.as_deref().ok_or_else(|| {
+        HttpErrorJson::new(Status::BadRequest, "Select a signed sync purpose.".into())
+    })?;
+    if purpose_id != SYNC_EGRESS_PURPOSE_V1 {
+        return Err(HttpErrorJson::new(Status::Forbidden, "Only the signed sync purpose can enable synchronization.".into()));
+    }
+    let policy = super::egress::active_policy(datastore, trust)?;
+    if !sync_destination_available(policy.policy(), destination_id, purpose_id) {
+        return Err(HttpErrorJson::new(Status::Forbidden, "The sync purpose is not in the signed destination policy.".into()));
+    }
+    if proxy.kill_switch_enabled().unwrap_or(true) {
+        return Err(HttpErrorJson::new(Status::Forbidden, "Sync is paused by the egress kill switch.".into()));
+    }
+    let preparing = datastore.sync_baseline_progress().map_err(HttpErrorJson::from)?
+        .is_some_and(|progress| !progress.complete);
+    if create_snapshot && !preparing {
+        SyncControl::new().invoke(datastore, "create_current_sync_snapshot", serde_json::json!({}))
+            .map_err(|message| HttpErrorJson::new(Status::Forbidden, message))?;
+    }
+    let progress = SyncControl::new().prepare_sync_baseline(datastore, 128)
+        .map_err(|_| HttpErrorJson::new(Status::Forbidden, "Sync baseline preparation requires recovery and a trusted current-epoch device.".into()))?;
+    if !progress.complete {
+        proxy.set_sync_enabled(false, None, None)
+            .map_err(|_| HttpErrorJson::new(Status::Forbidden, "Sync consent could not be paused during baseline preparation.".into()))?;
+        return Ok(SyncEgressControlResponse {
+            enabled: false, destination_id: None, purpose_id: None, preparing: true, baseline: Some(progress),
+        });
+    }
+    let refreshed_policy = super::egress::active_policy(datastore, trust)?;
+    if !sync_destination_available(refreshed_policy.policy(), destination_id, purpose_id)
+        || proxy.kill_switch_enabled().unwrap_or(true) {
+        return Err(HttpErrorJson::new(Status::Forbidden, "Sync is no longer permitted by current privacy controls.".into()));
+    }
+    proxy.set_sync_enabled(true, Some(destination_id.into()), Some(purpose_id.into()))
+        .map_err(|_| HttpErrorJson::new(Status::Forbidden, "Sync remains unavailable under the current privacy controls.".into()))?;
+    Ok(SyncEgressControlResponse {
+        enabled: true, destination_id: Some(destination_id.into()), purpose_id: Some(purpose_id.into()),
+        preparing: false, baseline: Some(progress),
+    })
+}
+
 #[get("/enabled")]
 pub async fn sync_enabled(state: &State<ServerState>) -> Result<Json<SyncEgressControlResponse>, HttpErrorJson> {
     let datastore = state.datastore.clone();
-    rocket::tokio::task::spawn_blocking(move || {
-        let consent = datastore.sync_egress_consent().map_err(HttpErrorJson::from)?;
-        let baseline = datastore.sync_baseline_progress().map_err(HttpErrorJson::from)?;
-        Ok(Json(SyncEgressControlResponse {
-            enabled: consent.is_some(),
-            destination_id: consent.as_ref().map(|value| value.destination_id.clone()),
-            purpose_id: consent.map(|value| value.purpose_id),
-            preparing: baseline.as_ref().is_some_and(|progress| !progress.complete),
-            baseline,
-        }))
-    }).await
+    rocket::tokio::task::spawn_blocking(move || local_sync_status(&datastore).map(Json)).await
         .map_err(|_| HttpErrorJson::new(Status::ServiceUnavailable, "Sync state is unavailable.".into()))?
 }
 
 #[post("/run")]
 pub async fn run_sync(
-    state: &State<ServerState>,
-    trust: &State<EgressPolicyTrust>,
-    proxy: &State<EgressProxy>,
+    state: &State<ServerState>, trust: &State<EgressPolicyTrust>, proxy: &State<EgressProxy>,
 ) -> Result<Json<Value>, HttpErrorJson> {
     let datastore = state.datastore.clone();
     let trust = trust.inner().clone();
     let proxy = proxy.inner().clone();
-    rocket::tokio::task::spawn_blocking(move || {
-        let sync_enabled = proxy.sync_enabled().map_err(|_| {
-            HttpErrorJson::new(Status::Forbidden, "Network sync is not enabled by local consent.".into())
-        })?;
-        if !sync_enabled {
-            return Err(HttpErrorJson::new(Status::Forbidden, "Network sync is not enabled by local consent.".into()));
-        }
-        let consent = datastore.sync_egress_consent()
-            .map_err(HttpErrorJson::from)?
-            .ok_or_else(|| HttpErrorJson::new(Status::Forbidden, "No signed sync destination is selected.".into()))?;
-        let policy = super::egress::active_policy(&datastore, &trust)
-            .map_err(|_| HttpErrorJson::new(Status::Forbidden, "The signed sync policy is unavailable or untrusted.".into()))?;
-        if !policy.policy().purposes.iter().any(|purpose| {
-            purpose.id == consent.purpose_id
-                && purpose.destination_id == consent.destination_id
-                && purpose.id == SYNC_EGRESS_PURPOSE_V1
-        }) {
-            return Err(HttpErrorJson::new(Status::Forbidden, "Sync is not permitted by the active signed policy.".into()));
-        }
-        let transport = EgressSyncRelayTransportV1::new(proxy, policy);
-        let remote = SyncHttpObjectStoreV1::new(consent.destination_id, consent.purpose_id, transport)
-            .map_err(|_| HttpErrorJson::new(Status::Forbidden, "The signed sync destination is invalid.".into()))?;
-        SyncControl::new()
-            .sync_operations(&datastore, &remote)
-            .map(Json)
-            .map_err(|error| HttpErrorJson::new(
-                if error.retryable { Status::ServiceUnavailable } else { Status::Conflict },
-                "Encrypted sync did not complete; local operation data remains in the encrypted vault.".into(),
-            ))
-    }).await
+    rocket::tokio::task::spawn_blocking(move || run_local_sync(&datastore, &trust, &proxy)
+        .map(Json).map_err(|(error, _)| error)).await
         .map_err(|_| HttpErrorJson::new(Status::ServiceUnavailable, "Sync task stopped.".into()))?
 }
 
 #[post("/enabled", data = "<request>", format = "application/json")]
 pub async fn set_sync_enabled(
-    request: Json<SyncEgressControlRequest>,
-    state: &State<ServerState>,
-    trust: &State<EgressPolicyTrust>,
-    proxy: &State<EgressProxy>,
+    request: Json<SyncEgressControlRequest>, state: &State<ServerState>,
+    trust: &State<EgressPolicyTrust>, proxy: &State<EgressProxy>,
 ) -> Result<Json<SyncEgressControlResponse>, HttpErrorJson> {
     let request = request.into_inner();
     let datastore = state.datastore.clone();
     let proxy = proxy.inner().clone();
     let trust = trust.inner().clone();
-    rocket::tokio::task::spawn_blocking(move || {
-        if request.enabled {
-            let destination_id = request.destination_id.as_deref().ok_or_else(|| {
-                HttpErrorJson::new(Status::BadRequest, "Select a signed sync destination.".into())
-            })?;
-            let purpose_id = request.purpose_id.as_deref().ok_or_else(|| {
-                HttpErrorJson::new(Status::BadRequest, "Select a signed sync purpose.".into())
-            })?;
-            if purpose_id != SYNC_EGRESS_PURPOSE_V1 {
-                return Err(HttpErrorJson::new(Status::Forbidden, "Only the signed sync purpose can enable synchronization.".into()));
-            }
-            let policy = super::egress::active_policy(&datastore, &trust)?;
-            if !policy.policy().purposes.iter().any(|purpose| {
-                purpose.id == purpose_id && purpose.destination_id == destination_id
-            }) {
-                return Err(HttpErrorJson::new(Status::Forbidden, "The sync purpose is not in the signed destination policy.".into()));
-            }
-            if proxy.kill_switch_enabled().unwrap_or(true) {
-                return Err(HttpErrorJson::new(Status::Forbidden, "Sync is paused by the egress kill switch.".into()));
-            }
-            let progress = SyncControl::new().prepare_sync_baseline(&datastore, 128)
-                .map_err(|_| HttpErrorJson::new(Status::Forbidden, "Sync baseline preparation requires recovery and a trusted current-epoch device.".into()))?;
-            if !progress.complete {
-                proxy.set_sync_enabled(false, None, None)
-                    .map_err(|_| HttpErrorJson::new(Status::Forbidden, "Sync consent could not be paused during baseline preparation.".into()))?;
-                return Ok(Json(SyncEgressControlResponse {
-                    enabled: false,
-                    destination_id: None,
-                    purpose_id: None,
-                    preparing: true,
-                    baseline: Some(progress),
-                }));
-            }
-            let refreshed_policy = super::egress::active_policy(&datastore, &trust)?;
-            if !refreshed_policy.policy().purposes.iter().any(|purpose| {
-                purpose.id == purpose_id && purpose.destination_id == destination_id
-            }) || proxy.kill_switch_enabled().unwrap_or(true) {
-                return Err(HttpErrorJson::new(Status::Forbidden, "Sync is no longer permitted by current privacy controls.".into()));
-            }
-            proxy.set_sync_enabled(true, Some(destination_id.into()), Some(purpose_id.into()))
-                .map_err(|_| HttpErrorJson::new(Status::Forbidden, "Sync remains unavailable under the current privacy controls.".into()))?;
-            return Ok(Json(SyncEgressControlResponse {
-                enabled: true,
-                destination_id: Some(destination_id.into()),
-                purpose_id: Some(purpose_id.into()),
-                preparing: false,
-                baseline: Some(progress),
-            }));
-        }
-        proxy.set_sync_enabled(false, None, None)
-            .map_err(|_| HttpErrorJson::new(Status::Forbidden, "Sync remains unavailable under the current privacy controls.".into()))?;
-        let baseline = datastore.sync_baseline_progress().map_err(HttpErrorJson::from)?;
-        Ok(Json(SyncEgressControlResponse {
-            enabled: false,
-            destination_id: None,
-            purpose_id: None,
-            preparing: baseline.as_ref().is_some_and(|progress| !progress.complete),
-            baseline,
-        }))
-    }).await
+    rocket::tokio::task::spawn_blocking(move || set_local_sync_enabled(&datastore, &trust, &proxy, &request, false).map(Json)).await
         .map_err(|_| HttpErrorJson::new(Status::ServiceUnavailable, "Sync state is unavailable.".into()))?
 }
 
@@ -321,10 +320,14 @@ pub async fn relay_request(
 ) -> Result<Json<SyncRelayResponseV1>, HttpErrorJson> {
     let request = request.into_inner();
     request.request.validate().map_err(|_| HttpErrorJson::new(Status::BadRequest, "Invalid opaque sync request.".into()))?;
+    if request.request.operation==aw_sync_e2ee::SyncRelayOperationV1::DeleteSelectedBackup {return Err(HttpErrorJson::new(Status::Forbidden,"Selected backup deletion requires its dedicated reviewed workflow.".into()));}
     let datastore = state.datastore.clone();
     let trust = trust.inner().clone();
     let proxy = proxy.inner().clone();
     rocket::tokio::task::spawn_blocking(move || {
+        proxy.require_sync_access(Utc::now()).map_err(|_| {
+            HttpErrorJson::new(Status::Forbidden, "A current signed paid sync entitlement is required.".into())
+        })?;
         let deleting = request.request.operation == aw_sync_e2ee::SyncRelayOperationV1::DeleteAfterTombstone;
         if deleting && request.tombstones.is_empty() {
             return Err(HttpErrorJson::new(Status::BadRequest, "Remote delete requires tombstone acknowledgements.".into()));
@@ -384,6 +387,7 @@ pub async fn relay_request(
                     ..Default::default()
                 })
             }
+            aw_sync_e2ee::SyncRelayOperationV1::DeleteSelectedBackup => return Err(HttpErrorJson::new(Status::Forbidden,"Selected backup deletion requires its dedicated reviewed workflow.".into())),
             aw_sync_e2ee::SyncRelayOperationV1::DeleteAfterTombstone => {
                 let permit = deletion_permit.as_ref()
                     .ok_or_else(|| HttpErrorJson::new(Status::BadRequest, "Delete request has no tombstone permit.".into()))?;
@@ -404,4 +408,230 @@ pub async fn relay_request(
             })
     }).await
         .map_err(|_| HttpErrorJson::new(Status::ServiceUnavailable, "Remote sync request stopped.".into()))?
+}
+
+use rocket::data::{Data, ToByteUnit};
+
+const POLICY_SMALL_BODY: u64 = 1024;
+const POLICY_CHOICE_BODY: u64 = 4 * aw_models::SYNC_MAX_CHUNK_BYTES as u64;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyListRequest {
+    schema_version: u16,
+    after: Option<String>,
+    limit: usize,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyPreviewRequest {
+    schema_version: u16,
+    candidate_id: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyChoiceRequest {
+    choice: aw_models::SyncPolicyChoiceRequestV1,
+    firewall: Option<super::egress::SyncPolicyFirewallReviewV1>,
+}
+#[derive(Serialize)]
+pub(crate) struct PolicyPreviewResponse {
+    policy: aw_models::SyncPolicyPreviewV1,
+    firewall: Option<super::egress::SyncPolicyFirewallReviewV1>,
+    accept_remote_available: bool,
+    reason: Option<&'static str>,
+}
+fn policy_error(status: Status) -> HttpErrorJson {
+    HttpErrorJson::new(
+        status,
+        "The local policy review could not be completed. Refresh and review it again.".into(),
+    )
+}
+fn policy_gate(config: &crate::config::AWConfig, state: &ServerState) -> Result<(), HttpErrorJson> {
+    if config.auth.sessions.is_none() {
+        return Err(policy_error(Status::Forbidden));
+    }
+    if !state.datastore.is_encrypted() {
+        return Err(policy_error(Status::ServiceUnavailable));
+    }
+    if state.datastore.is_locked() {
+        return Err(policy_error(Status::Locked));
+    }
+    Ok(())
+}
+fn policy_store_error(datastore: &Datastore) -> HttpErrorJson {
+    policy_error(if datastore.is_locked() {
+        Status::Locked
+    } else {
+        Status::Conflict
+    })
+}
+// Typed decoding rejects duplicate/unknown fields; this second pass rejects positional struct arrays.
+fn policy_record_shapes(source: &Value, typed: &Value) -> bool {
+    match typed {
+        Value::Object(expected) => source.as_object().is_some_and(|record| {
+            record.iter().all(|(key, value)| {
+                expected
+                    .get(key)
+                    .is_some_and(|expected| policy_record_shapes(value, expected))
+            })
+        }),
+        Value::Array(expected) => source.as_array().is_some_and(|items| {
+            items.len() == expected.len()
+                && items
+                    .iter()
+                    .zip(expected)
+                    .all(|(item, expected)| policy_record_shapes(item, expected))
+        }),
+        _ => true,
+    }
+}
+async fn policy_body<T: serde::de::DeserializeOwned + Serialize>(
+    data: Data<'_>,
+    max: u64,
+) -> Result<T, HttpErrorJson> {
+    let bytes = data
+        .open((max + 1).bytes())
+        .into_bytes()
+        .await
+        .map_err(|_| policy_error(Status::BadRequest))?;
+    if !bytes.is_complete() || bytes.len() > max as usize {
+        return Err(policy_error(Status::PayloadTooLarge));
+    }
+    if bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(policy_error(Status::BadRequest));
+    }
+    let typed: T = serde_json::from_slice(&bytes).map_err(|_| policy_error(Status::BadRequest))?;
+    let source: Value =
+        serde_json::from_slice(&bytes).map_err(|_| policy_error(Status::BadRequest))?;
+    let encoded = serde_json::to_value(&typed).map_err(|_| policy_error(Status::BadRequest))?;
+    if !policy_record_shapes(&source, &encoded) {
+        return Err(policy_error(Status::BadRequest));
+    }
+    Ok(typed)
+}
+async fn policy_work<T: Serialize + Send + 'static>(
+    action: impl FnOnce() -> Result<T, HttpErrorJson> + Send + 'static,
+) -> Result<Json<T>, HttpErrorJson> {
+    let value = rocket::tokio::task::spawn_blocking(action)
+        .await
+        .map_err(|_| policy_error(Status::ServiceUnavailable))??;
+    aw_models::serialized_size(&value, POLICY_CHOICE_BODY as usize)
+        .map_err(|_| policy_error(Status::PayloadTooLarge))?;
+    Ok(Json(value))
+}
+
+#[post("/policies/list", data = "<data>", format = "application/json")]
+pub(crate) async fn list_policies(
+    config: &State<crate::config::AWConfig>,
+    state: &State<ServerState>,
+    data: Data<'_>,
+) -> Result<Json<aw_models::SyncPolicyCandidatePageV1>, HttpErrorJson> {
+    policy_gate(config, state)?;
+    let request = policy_body::<PolicyListRequest>(data, POLICY_SMALL_BODY).await?;
+    if request.schema_version != 1
+        || !(1..=256).contains(&request.limit)
+        || request
+            .after
+            .as_ref()
+            .is_some_and(|id| !aw_models::valid_lower_hex(id, 64))
+    {
+        return Err(policy_error(Status::BadRequest));
+    }
+    let datastore = state.datastore.clone();
+    policy_work(move || {
+        datastore
+            .list_sync_policy_candidates(request.after.as_deref(), request.limit)
+            .map_err(|_| policy_store_error(&datastore))
+    })
+    .await
+}
+
+#[post("/policies/preview", data = "<data>", format = "application/json")]
+pub(crate) async fn preview_policy(
+    config: &State<crate::config::AWConfig>,
+    state: &State<ServerState>,
+    trust: &State<EgressPolicyTrust>,
+    proxy: &State<EgressProxy>,
+    data: Data<'_>,
+) -> Result<Json<PolicyPreviewResponse>, HttpErrorJson> {
+    policy_gate(config, state)?;
+    let request = policy_body::<PolicyPreviewRequest>(data, POLICY_SMALL_BODY).await?;
+    if request.schema_version != 1 || !aw_models::valid_lower_hex(&request.candidate_id, 64) {
+        return Err(policy_error(Status::BadRequest));
+    }
+    let datastore = state.datastore.clone();
+    let trust = trust.inner().clone();
+    let proxy = proxy.inner().clone();
+    policy_work(move || {
+        let policy = datastore
+            .preview_sync_policy_candidate(&request.candidate_id)
+            .map_err(|_| policy_store_error(&datastore))?;
+        let (firewall, available, reason) = if policy.candidate.field.starts_with("egress.") {
+            match super::egress::preview_sync_policy(
+                &datastore,
+                &trust,
+                &proxy,
+                &request.candidate_id,
+            ) {
+                Ok(review) => (review.firewall, true, None),
+                Err(_) => (None, false, Some("firewall-review-unavailable")),
+            }
+        } else {
+            (None, true, None)
+        };
+        let fresh = datastore
+            .preview_sync_policy_candidate(&request.candidate_id)
+            .map_err(|_| policy_store_error(&datastore))?;
+        if fresh.expected_review_sha256 != policy.expected_review_sha256 {
+            return Err(policy_error(Status::Conflict));
+        }
+        Ok(PolicyPreviewResponse {
+            policy,
+            firewall,
+            accept_remote_available: available,
+            reason,
+        })
+    })
+    .await
+}
+
+#[post("/policies/choice", data = "<data>", format = "application/json")]
+pub(crate) async fn choose_policy(
+    config: &State<crate::config::AWConfig>,
+    state: &State<ServerState>,
+    trust: &State<EgressPolicyTrust>,
+    proxy: &State<EgressProxy>,
+    data: Data<'_>,
+) -> Result<Json<aw_models::SyncPolicyChoiceResultV1>, HttpErrorJson> {
+    policy_gate(config, state)?;
+    let request = policy_body::<PolicyChoiceRequest>(data, POLICY_CHOICE_BODY).await?;
+    request
+        .choice
+        .validate()
+        .map_err(|_| policy_error(Status::BadRequest))?;
+    let datastore = state.datastore.clone();
+    let trust = trust.inner().clone();
+    let proxy = proxy.inner().clone();
+    policy_work(move || {
+        super::egress::choose_sync_policy(
+            &datastore,
+            &trust,
+            &proxy,
+            request.choice,
+            request.firewall,
+        )
+        .map_err(|_| policy_store_error(&datastore))
+    })
+    .await
+}
+
+#[get("/policies/context")]
+pub(crate) async fn policy_context(
+    config: &State<crate::config::AWConfig>,
+    state: &State<ServerState>,
+) -> Result<Json<aw_models::SyncPolicyContextV1>, HttpErrorJson> {
+    policy_gate(config, state)?;
+    let datastore = state.datastore.clone();
+    policy_work(move || datastore.get_sync_policy_context().map_err(|_| policy_store_error(&datastore))).await
 }

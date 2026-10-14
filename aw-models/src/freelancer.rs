@@ -3,6 +3,8 @@
 use chrono::NaiveDate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+pub const FREELANCER_TIMESHEET_EGRESS_PURPOSE_V1: &str = "freelancer-timesheet-v1";
 use std::collections::BTreeSet;
 use std::fmt;
 

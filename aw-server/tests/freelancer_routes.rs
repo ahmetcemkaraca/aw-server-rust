@@ -1,15 +1,36 @@
 use aw_datastore::Datastore;
-use aw_models::{freelancer_report_signature_message_v1, ApprovedTimesheetV1, FreelancerWorkspaceV1};
+use aw_models::{
+    freelancer_report_signature_message_v1, ApprovedTimesheetV1, FreelancerWorkspaceV1,
+};
 use aw_server::{
     config::AWConfig,
     endpoints::{self, AssetResolver, ServerState},
     sessions::{Scope, Sessions},
 };
+use ring::signature::{UnparsedPublicKey, ED25519};
 use rocket::http::{ContentType, Header, Status};
 use rocket::local::blocking::Client;
-use ring::signature::{UnparsedPublicKey, ED25519};
+use std::sync::Arc;
+mod entitlement_fixture {
+    include!("support/entitlement.rs");
+}
 
 fn setup(datastore: Datastore) -> (Client, String, String) {
+    let now = entitlement_fixture::aw_server_time();
+    setup_with_access(
+        datastore,
+        entitlement_fixture::configured_access(
+            entitlement_fixture::freelancer_proof(now, 1, false),
+            now,
+        )
+        .0,
+    )
+}
+
+fn setup_with_access(
+    datastore: Datastore,
+    access: Arc<aw_entitlements::RuntimeFeatureAccessV1>,
+) -> (Client, String, String) {
     let sessions = Sessions::new(5600, false);
     let admin = sessions.mint(Scope::Admin).unwrap();
     let read = sessions.mint(Scope::Read).unwrap();
@@ -21,13 +42,194 @@ fn setup(datastore: Datastore) -> (Client, String, String) {
     let mut config = AWConfig::default();
     config.port = 5600;
     config.auth.sessions = Some(sessions);
-    (Client::tracked(endpoints::build_rocket(state, config)).unwrap(), admin, read)
+    config.feature_access = access;
+    (
+        Client::tracked(endpoints::build_rocket(state, config)).unwrap(),
+        admin,
+        read,
+    )
+}
+
+fn workspace_update(label: &str, revision: u64) -> serde_json::Value {
+    serde_json::json!({"expected_revision":revision,"workspace":{"schema_version":1,"revision":revision,
+        "projects":[{"project_alias":"project-9af31c","label":label,"billable_default":true,
+            "rounding_increment_seconds":900,"rounding_mode":"nearest","currency_code":"EUR","hourly_rate_minor":7500}],
+        "category_rules":[{"category_path":["Work","Client work"],"project_alias":"project-9af31c"}]}})
+}
+
+#[test]
+fn freelancer_paid_work_is_denied_without_a_plan_and_does_not_modify_vault_metadata() {
+    let store = Datastore::new_encrypted(":memory:".into(), "9a".repeat(32), false);
+    let before = store.get_key_values("%").unwrap();
+    let (client, admin, _) = setup_with_access(store.clone(), Arc::default());
+    let host = Header::new("Host", "localhost:5600");
+    let auth = Header::new("Authorization", format!("Bearer {admin}"));
+    assert_eq!(
+        client
+            .get("/api/0/freelancer/workspace")
+            .header(host.clone())
+            .header(auth.clone())
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+    assert_eq!(
+        client
+            .put("/api/0/freelancer/workspace")
+            .header(host.clone())
+            .header(auth.clone())
+            .header(ContentType::JSON)
+            .body(workspace_update("Private project", 0).to_string())
+            .dispatch()
+            .status(),
+        Status::Forbidden
+    );
+    let timesheet = r#"{"schema_version":1,"project_alias":"project-9af31c","date":"2026-10-13","approved_duration_seconds":600,"user_note":null}"#;
+    for path in ["preview", "sign"] {
+        assert_eq!(
+            client
+                .post(format!("/api/0/freelancer/timesheet/{path}"))
+                .header(host.clone())
+                .header(auth.clone())
+                .header(ContentType::JSON)
+                .body(timesheet)
+                .dispatch()
+                .status(),
+            Status::Forbidden
+        );
+    }
+    assert_eq!(store.get_key_values("%").unwrap(), before);
+}
+
+#[test]
+fn freelancer_revocation_preserves_read_and_removal_only_access_without_allowing_corrections() {
+    let store = Datastore::new_encrypted(":memory:".into(), "9a".repeat(32), false);
+    let now = entitlement_fixture::aw_server_time();
+    let (access, _) = entitlement_fixture::configured_access(
+        entitlement_fixture::freelancer_proof(now, 1, false),
+        now,
+    );
+    let (client, admin, _) = setup_with_access(store.clone(), access.clone());
+    let host = Header::new("Host", "localhost:5600");
+    let auth = Header::new("Authorization", format!("Bearer {admin}"));
+    let updated = client
+        .put("/api/0/freelancer/workspace")
+        .header(host.clone())
+        .header(auth.clone())
+        .header(ContentType::JSON)
+        .body(workspace_update("Private project", 0).to_string())
+        .dispatch();
+    assert_eq!(updated.status(), Status::Ok);
+    let original: serde_json::Value =
+        serde_json::from_str(&updated.into_string().unwrap()).unwrap();
+    assert!(access
+        .install(entitlement_fixture::freelancer_proof(now, 2, true), now)
+        .is_err());
+    let before = store.get_key_values("%").unwrap();
+    assert_eq!(
+        client
+            .put("/api/0/freelancer/workspace")
+            .header(host.clone())
+            .header(auth.clone())
+            .header(ContentType::JSON)
+            .body(workspace_update("Unlicensed correction", 1).to_string())
+            .dispatch()
+            .status(),
+        Status::Forbidden
+    );
+    let timesheet = r#"{"schema_version":1,"project_alias":"project-9af31c","date":"2026-10-13","approved_duration_seconds":600,"user_note":null}"#;
+    for path in ["preview", "sign"] {
+        assert_eq!(
+            client
+                .post(format!("/api/0/freelancer/timesheet/{path}"))
+                .header(host.clone())
+                .header(auth.clone())
+                .header(ContentType::JSON)
+                .body(timesheet)
+                .dispatch()
+                .status(),
+            Status::Forbidden
+        );
+    }
+    assert_eq!(store.get_key_values("%").unwrap(), before);
+    let read = client
+        .get("/api/0/freelancer/workspace")
+        .header(host.clone())
+        .header(auth.clone())
+        .dispatch();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&read.into_string().unwrap()).unwrap(),
+        original
+    );
+    let mut removal = original;
+    removal["category_rules"] = serde_json::json!([]);
+    let deleted = client
+        .put("/api/0/freelancer/workspace")
+        .header(host.clone())
+        .header(auth.clone())
+        .header(ContentType::JSON)
+        .body(serde_json::json!({"expected_revision":1,"workspace":removal}).to_string())
+        .dispatch();
+    assert_eq!(deleted.status(), Status::Ok);
+    removal["revision"] = serde_json::json!(2);
+    removal["projects"] = serde_json::json!([]);
+    let cleared = client
+        .put("/api/0/freelancer/workspace")
+        .header(host)
+        .header(auth)
+        .header(ContentType::JSON)
+        .body(serde_json::json!({"expected_revision":2,"workspace":removal}).to_string())
+        .dispatch();
+    assert_eq!(cleared.status(), Status::Ok);
+    let final_workspace: FreelancerWorkspaceV1 =
+        serde_json::from_str(&cleared.into_string().unwrap()).unwrap();
+    assert!(final_workspace.projects.is_empty());
+    assert!(final_workspace.category_rules.is_empty());
 }
 
 fn decode_hex(value: &str) -> Vec<u8> {
-    value.as_bytes().chunks_exact(2)
+    value
+        .as_bytes()
+        .chunks_exact(2)
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
+}
+
+#[test]
+fn unlicensed_workspace_removal_preserves_order_and_noops_do_not_increment_revision() {
+    let store = Datastore::new_encrypted(":memory:".into(), "9a".repeat(32), false);
+    let mut workspace = workspace_update("Private project", 3)["workspace"].clone();
+    let base = workspace["projects"][0].clone();
+    let projects = ["project-a", "project-b", "project-c"].map(|alias| {
+        let mut project = base.clone(); project["project_alias"] = serde_json::json!(alias); project
+    });
+    workspace["projects"] = serde_json::json!(projects);
+    workspace["category_rules"] = serde_json::json!([]);
+    store.set_key_value("freelancer.workspace.v1", &workspace.to_string()).unwrap();
+    let (client, admin, _) = setup_with_access(store.clone(), Arc::default());
+    let host = Header::new("Host", "localhost:5600");
+    let auth = Header::new("Authorization", format!("Bearer {admin}"));
+    let put = |workspace: &serde_json::Value| client.put("/api/0/freelancer/workspace")
+        .header(host.clone()).header(auth.clone()).header(ContentType::JSON)
+        .body(serde_json::json!({"expected_revision":workspace["revision"],"workspace":workspace}).to_string()).dispatch();
+    let original = store.get_key_values("%").unwrap();
+    let mut changed = workspace.clone();
+    changed["projects"] = serde_json::json!([projects[2], projects[0]]);
+    assert_eq!(put(&changed).status(), Status::Forbidden);
+    changed["projects"] = serde_json::json!([projects[0], projects[2]]);
+    changed["projects"][0]["label"] = serde_json::json!("Unlicensed correction");
+    assert_eq!(put(&changed).status(), Status::Forbidden);
+    assert_eq!(store.get_key_values("%").unwrap(), original);
+    changed["projects"][0] = projects[0].clone();
+    let removed = put(&changed);
+    assert_eq!(removed.status(), Status::Ok);
+    let retained: serde_json::Value = serde_json::from_str(&removed.into_string().unwrap()).unwrap();
+    assert_eq!(retained["revision"], 4);
+    let before_noop = store.get_key_values("%").unwrap();
+    let noop = put(&retained);
+    assert_eq!(noop.status(), Status::Ok);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&noop.into_string().unwrap()).unwrap(), retained);
+    assert_eq!(store.get_key_values("%").unwrap(), before_noop);
 }
 
 #[test]

@@ -34,6 +34,17 @@ impl Default for CapturePolicy {
 }
 
 impl CapturePolicy {
+    pub fn canonical_manual_entry_id(value: &str) -> Option<String> {
+        if value.len() != 36 || value.bytes().enumerate().any(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) { byte != b'-' } else { !byte.is_ascii_hexdigit() }
+        }) { return None; }
+        Some(value.to_ascii_lowercase())
+    }
+
+    pub fn valid_manual_source_sha256(value: &str) -> bool {
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
     pub fn active(&self, now: DateTime<Utc>) -> bool {
         self.recording && now >= self.effective_from && (self.window || self.idle || self.browser)
             && self.paused_until.is_none_or(|until| now >= until)
@@ -78,7 +89,8 @@ impl CapturePolicy {
         let end = event.timestamp.checked_add_signed(event.duration)?;
         if event.timestamp.timestamp_nanos_opt().is_none() || end.timestamp_nanos_opt().is_none()
             || (capture && end > Utc::now() + chrono::Duration::seconds(5)) { return None; }
-        if capture && bucket != "aw-stopwatch" {
+        let manual_bucket = matches!(bucket, "aw-stopwatch" | "aw-stopwatch-ios-companion");
+        if capture && !manual_bucket {
             if !self.active(Utc::now()) { return None; }
             let boundary = self.paused_until.map_or(self.effective_from, |until| until.max(self.effective_from));
             if event.timestamp < boundary {
@@ -89,12 +101,26 @@ impl CapturePolicy {
         }
         let private = event.data.get("incognito").or_else(|| event.data.get("private"));
         if private.is_some_and(|value| value != &Value::Bool(false)) { return None; }
-        if bucket == "aw-stopwatch" {
+        if manual_bucket {
             let label = event.data.get("label").and_then(Value::as_str)?.to_string();
             let running = event.data.get("running").and_then(Value::as_bool)?;
+            let manual_id = match event.data.get("manual_entry_id") {
+                Some(value) => Some(Self::canonical_manual_entry_id(value.as_str()?)?),
+                None => None,
+            };
+            let source_hash = match event.data.get("manual_source_sha256") {
+                Some(value) => {
+                    let hash = value.as_str()?;
+                    if manual_id.is_none() || !Self::valid_manual_source_sha256(hash) { return None; }
+                    Some(hash.to_owned())
+                },
+                None => None,
+            };
             event.data.clear();
             event.data.insert("label".into(), Value::String(label));
             event.data.insert("running".into(), Value::Bool(running));
+            if let Some(id) = manual_id { event.data.insert("manual_entry_id".into(), Value::String(id)); }
+            if let Some(hash) = source_hash { event.data.insert("manual_source_sha256".into(), Value::String(hash)); }
             return Some(event);
         }
         if bucket.starts_with("aw-watcher-afk_") {
@@ -223,5 +249,22 @@ mod tests {
         let stored = policy.filter("aw-stopwatch", value, true).unwrap();
         assert_eq!(stored.data, json!({"label":"Planning", "running":true}).as_object().unwrap().clone());
         assert!(!policy.active(Utc::now()));
+    }
+
+    #[test]
+    fn manual_identity_and_source_digest_survive_minimization_but_private_notes_do_not() {
+        let policy = CapturePolicy::default();
+        for bucket in ["aw-stopwatch", "aw-stopwatch-ios-companion"] {
+            let value = event(json!({"label":"Manual activity","running":false,"manual_entry_id":"01234567-89AB-4CDE-8FAB-0123456789AB","manual_source_sha256":"ab".repeat(32),"note":"Only in the private companion vault"}));
+            let stored = policy.filter(bucket,value,false).unwrap();
+            assert_eq!(stored.data.len(),4);
+            assert_eq!(stored.data["manual_entry_id"],"01234567-89ab-4cde-8fab-0123456789ab");
+            assert!(!stored.data.contains_key("note"));
+        }
+        for metadata in [json!({"manual_entry_id":"invalid"}),json!({"manual_source_sha256":"ab".repeat(32)}),json!({"manual_entry_id":"01234567-89ab-4cde-8fab-0123456789ab","manual_source_sha256":"invalid"})] {
+            let mut value = json!({"label":"Manual activity","running":false});
+            value.as_object_mut().unwrap().extend(metadata.as_object().unwrap().clone());
+            assert!(policy.filter("aw-stopwatch-ios-companion",event(value),false).is_none());
+        }
     }
 }

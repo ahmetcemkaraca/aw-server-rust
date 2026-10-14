@@ -287,6 +287,7 @@ name = "aw-egress"
 version = "0.1.0"
 dependencies = [
  "aw-datastore",
+ "aw-entitlements",
  "aw-models",
  "aw-sync-e2ee",
  "base64",
@@ -351,6 +352,7 @@ dependencies = [
  "plex",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]
@@ -361,6 +363,7 @@ dependencies = [
  "aw-client-rust",
  "aw-datastore",
  "aw-egress",
+ "aw-entitlements",
  "aw-models",
  "aw-plugin-runtime",
  "aw-query",
@@ -383,6 +386,7 @@ dependencies = [
  "ring",
  "rocket",
  "rocket_cors",
+ "rusqlite",
  "rust-embed",
  "sd-notify",
  "serde",

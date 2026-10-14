@@ -4,8 +4,7 @@ use std::fmt;
 
 use aw_models::{
     DevicePublicIdentityV1, Event, SyncBucketDescriptorV1, SyncChunkHeaderV1, SyncEnvelopeV1,
-    SyncOperationKindV1, SYNC_ID_BYTES, SYNC_MAX_CHUNK_BYTES,
-    SYNC_SCHEMA_VERSION_V1,
+    SyncOperationKindV1, SYNC_ID_BYTES, SYNC_MAX_CHUNK_BYTES, SYNC_SCHEMA_VERSION_V1,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -57,13 +56,14 @@ pub fn encrypt_manifest(
     header: &SyncChunkHeaderV1,
     manifest: &SyncManifestV1,
 ) -> Result<SyncEnvelopeV1, SyncErrorV1> {
-    manifest.validate().map_err(|_| SyncErrorV1::InvalidManifest)?;
+    manifest
+        .validate()
+        .map_err(|_| SyncErrorV1::InvalidManifest)?;
     if manifest.key_epoch != header.key_epoch {
         return Err(SyncErrorV1::InvalidManifest);
     }
-    let plaintext = Zeroizing::new(
-        serde_json::to_vec(manifest).map_err(|_| SyncErrorV1::InvalidManifest)?,
-    );
+    let plaintext =
+        Zeroizing::new(serde_json::to_vec(manifest).map_err(|_| SyncErrorV1::InvalidManifest)?);
     encrypt_chunk(key, header, &plaintext)
 }
 
@@ -74,7 +74,9 @@ pub fn decrypt_manifest(
     let plaintext = decrypt_chunk(key, envelope)?;
     let manifest: SyncManifestV1 =
         serde_json::from_slice(&plaintext).map_err(|_| SyncErrorV1::InvalidManifest)?;
-    manifest.validate().map_err(|_| SyncErrorV1::InvalidManifest)?;
+    manifest
+        .validate()
+        .map_err(|_| SyncErrorV1::InvalidManifest)?;
     if manifest.key_epoch != envelope.key_epoch {
         return Err(SyncErrorV1::InvalidManifest);
     }
@@ -94,6 +96,8 @@ pub struct SyncOperationV1 {
     pub kind: SyncOperationKindV1,
     pub policy_version: Option<u64>,
     pub fields: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_forget_fragment: Option<aw_models::BackupForgetFragmentV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -107,8 +111,10 @@ pub struct SyncTombstoneAckV1 {
 impl SyncTombstoneAckV1 {
     pub fn validate(&self) -> Result<(), MergeErrorV1> {
         decode_id(&self.origin_device_id)?;
-        if self.local_event_id == 0 || self.local_event_id > MAX_SQLITE_INTEGER
-            || self.tombstone_counter == 0 || self.tombstone_counter > MAX_SQLITE_INTEGER
+        if self.local_event_id == 0
+            || self.local_event_id > MAX_SQLITE_INTEGER
+            || self.tombstone_counter == 0
+            || self.tombstone_counter > MAX_SQLITE_INTEGER
         {
             return Err(MergeErrorV1::InvalidOperation);
         }
@@ -140,26 +146,69 @@ impl SyncOperationV1 {
         {
             return Err(MergeErrorV1::InvalidOperation);
         }
+        if self.kind != SyncOperationKindV1::BackupForget && self.backup_forget_fragment.is_some() {
+            return Err(MergeErrorV1::InvalidOperation);
+        }
         match &self.kind {
             SyncOperationKindV1::Upsert | SyncOperationKindV1::Correction => {
-                if self.local_event_id.filter(|id| *id > 0 && *id <= MAX_SQLITE_INTEGER).is_none()
+                if self
+                    .local_event_id
+                    .filter(|id| *id > 0 && *id <= MAX_SQLITE_INTEGER)
+                    .is_none()
                     || self.policy_version.is_some()
                     || self.fields.is_empty()
-                    || self.sync_bucket_id.as_deref().and_then(|id| decode_id(id).ok()).is_none()
-                    || (self.kind == SyncOperationKindV1::Upsert) != self.bucket_descriptor.is_some()
+                    || self
+                        .sync_bucket_id
+                        .as_deref()
+                        .and_then(|id| decode_id(id).ok())
+                        .is_none()
+                    || (self.kind == SyncOperationKindV1::Upsert)
+                        != self.bucket_descriptor.is_some()
                 {
                     return Err(MergeErrorV1::InvalidOperation);
                 }
                 if let Some(descriptor) = &self.bucket_descriptor {
-                    descriptor.validate().map_err(|_| MergeErrorV1::InvalidOperation)?;
+                    descriptor
+                        .validate()
+                        .map_err(|_| MergeErrorV1::InvalidOperation)?;
                 }
             }
             SyncOperationKindV1::Tombstone => {
-                if self.local_event_id.filter(|id| *id > 0 && *id <= MAX_SQLITE_INTEGER).is_none()
+                if self
+                    .local_event_id
+                    .filter(|id| *id > 0 && *id <= MAX_SQLITE_INTEGER)
+                    .is_none()
                     || self.policy_version.is_some()
                     || !self.fields.is_empty()
-                    || self.sync_bucket_id.as_deref().and_then(|id| decode_id(id).ok()).is_none()
+                    || self
+                        .sync_bucket_id
+                        .as_deref()
+                        .and_then(|id| decode_id(id).ok())
+                        .is_none()
                     || self.bucket_descriptor.is_some()
+                {
+                    return Err(MergeErrorV1::InvalidOperation);
+                }
+            }
+            SyncOperationKindV1::BackupForget => {
+                if self.local_event_id.is_some()
+                    || self.sync_bucket_id.is_some()
+                    || self.bucket_descriptor.is_some()
+                    || self.policy_version.is_some()
+                    || !self.fields.is_empty()
+                    || device_id != origin_device_id
+                {
+                    return Err(MergeErrorV1::InvalidOperation);
+                }
+                self.backup_forget_fragment
+                    .as_ref()
+                    .ok_or(MergeErrorV1::InvalidOperation)?
+                    .validate()
+                    .map_err(|_| MergeErrorV1::InvalidOperation)?;
+                if serde_json::to_vec(self)
+                    .map_err(|_| MergeErrorV1::InvalidOperation)?
+                    .len()
+                    > 512 * 1024
                 {
                     return Err(MergeErrorV1::InvalidOperation);
                 }
@@ -197,7 +246,9 @@ pub fn create_event_upsert(
         .num_nanoseconds()
         .filter(|duration| *duration >= 0)
         .ok_or(MergeErrorV1::InvalidOperation)?;
-    let mut fields = event.data.iter()
+    let mut fields = event
+        .data
+        .iter()
         .map(|(key, value)| (encode_sync_data_field_v1(key), value.clone()))
         .collect::<BTreeMap<_, _>>();
     fields.insert("duration_ns".into(), json!(duration_ns));
@@ -268,6 +319,7 @@ pub fn create_policy_change(
         sync_bucket_id: None,
         bucket_descriptor: None,
         kind: SyncOperationKindV1::PolicyChange,
+        backup_forget_fragment: None,
         policy_version: Some(policy_version),
         fields,
     };
@@ -294,6 +346,7 @@ fn event_operation(
         sync_bucket_id: sync_bucket_id.map(|id| URL_SAFE_NO_PAD.encode(id)),
         bucket_descriptor,
         kind,
+        backup_forget_fragment: None,
         policy_version: None,
         fields,
     };
@@ -337,7 +390,13 @@ impl SyncManifestV1 {
         operations: Vec<SyncOperationV1>,
     ) -> Result<Self, SyncErrorV1> {
         Self::new_signed_with_tombstone_acks(
-            writer, vault_id, key_epoch, revision, parent_hash, operations, Vec::new(),
+            writer,
+            vault_id,
+            key_epoch,
+            revision,
+            parent_hash,
+            operations,
+            Vec::new(),
         )
     }
 
@@ -350,14 +409,23 @@ impl SyncManifestV1 {
         operations: Vec<SyncOperationV1>,
         tombstone_acknowledgements: Vec<SyncTombstoneAckV1>,
     ) -> Result<Self, SyncErrorV1> {
-        if key_epoch == 0 || key_epoch > MAX_SQLITE_INTEGER || revision == 0 || revision > MAX_SQLITE_INTEGER {
+        if key_epoch == 0
+            || key_epoch > MAX_SQLITE_INTEGER
+            || revision == 0
+            || revision > MAX_SQLITE_INTEGER
+        {
             return Err(SyncErrorV1::InvalidManifest);
         }
-        let operations = canonical_operations(operations, MAX_OPERATIONS).map_err(|_| SyncErrorV1::InvalidManifest)?;
-        let tombstone_acknowledgements = canonical_tombstone_acknowledgements(tombstone_acknowledgements)
+        let operations = canonical_operations(operations, MAX_OPERATIONS)
             .map_err(|_| SyncErrorV1::InvalidManifest)?;
+        let tombstone_acknowledgements =
+            canonical_tombstone_acknowledgements(tombstone_acknowledgements)
+                .map_err(|_| SyncErrorV1::InvalidManifest)?;
         let writer_device_id = URL_SAFE_NO_PAD.encode(writer.device_id_bytes());
-        if operations.iter().any(|operation| operation.device_id != writer_device_id) {
+        if operations
+            .iter()
+            .any(|operation| operation.device_id != writer_device_id)
+        {
             return Err(SyncErrorV1::InvalidManifest);
         }
         let parent_hash = URL_SAFE_NO_PAD.encode(parent_hash);
@@ -373,12 +441,20 @@ impl SyncManifestV1 {
             signature: String::new(),
         };
         manifest.head_hash = URL_SAFE_NO_PAD.encode(
-            manifest.calculate_hash().map_err(|_| SyncErrorV1::InvalidManifest)?,
+            manifest
+                .calculate_hash()
+                .map_err(|_| SyncErrorV1::InvalidManifest)?,
         );
-        manifest.signature = URL_SAFE_NO_PAD.encode(writer.sign_manifest_bytes(
-            &manifest.signing_bytes(&vault_id).map_err(|_| SyncErrorV1::InvalidManifest)?,
-        ));
-        manifest.validate().map_err(|_| SyncErrorV1::InvalidManifest)?;
+        manifest.signature = URL_SAFE_NO_PAD.encode(
+            writer.sign_manifest_bytes(
+                &manifest
+                    .signing_bytes(&vault_id)
+                    .map_err(|_| SyncErrorV1::InvalidManifest)?,
+            ),
+        );
+        manifest
+            .validate()
+            .map_err(|_| SyncErrorV1::InvalidManifest)?;
         Ok(manifest)
     }
 
@@ -388,7 +464,9 @@ impl SyncManifestV1 {
         vault_id: &[u8; SYNC_ID_BYTES],
     ) -> Result<(), SyncErrorV1> {
         self.validate().map_err(|_| SyncErrorV1::InvalidManifest)?;
-        public_identity.validate().map_err(|_| SyncErrorV1::InvalidSignature)?;
+        public_identity
+            .validate()
+            .map_err(|_| SyncErrorV1::InvalidSignature)?;
         if self.writer_device_id != public_identity.device_id {
             return Err(SyncErrorV1::InvalidSignature);
         }
@@ -400,7 +478,8 @@ impl SyncManifestV1 {
             .map_err(|_| SyncErrorV1::InvalidSignature)?;
         UnparsedPublicKey::new(&ED25519, public_key)
             .verify(
-                &self.signing_bytes(vault_id)
+                &self
+                    .signing_bytes(vault_id)
                     .map_err(|_| SyncErrorV1::InvalidManifest)?,
                 &signature,
             )
@@ -422,13 +501,19 @@ impl SyncManifestV1 {
         let signature = URL_SAFE_NO_PAD
             .decode(&self.signature)
             .map_err(|_| MergeErrorV1::InvalidManifest)?;
-        if signature.len() != 64 || self.operations.iter().any(|op| op.device_id != self.writer_device_id) {
+        if signature.len() != 64
+            || self
+                .operations
+                .iter()
+                .any(|op| op.device_id != self.writer_device_id)
+        {
             return Err(MergeErrorV1::InvalidManifest);
         }
         if self.operations.len() > MAX_OPERATIONS
             || canonical_operations(self.operations.clone(), MAX_OPERATIONS)? != self.operations
             || self.tombstone_acknowledgements.len() > MAX_OPERATIONS
-            || canonical_tombstone_acknowledgements(self.tombstone_acknowledgements.clone())? != self.tombstone_acknowledgements
+            || canonical_tombstone_acknowledgements(self.tombstone_acknowledgements.clone())?
+                != self.tombstone_acknowledgements
             || serde_json::to_vec(self)
                 .map_err(|_| MergeErrorV1::InvalidManifest)?
                 .len()
@@ -491,7 +576,8 @@ impl SyncManifestV1 {
         let writer_device_id = decode_id(&self.writer_device_id)?;
         let parent_hash = decode_hash(&self.parent_hash)?;
         let head_hash = decode_hash(&self.head_hash)?;
-        let mut bytes = Vec::with_capacity(MANIFEST_SIGNATURE_DOMAIN.len() + 4 + 16 + 8 + 16 + 8 + 32 + 32);
+        let mut bytes =
+            Vec::with_capacity(MANIFEST_SIGNATURE_DOMAIN.len() + 4 + 16 + 8 + 16 + 8 + 32 + 32);
         bytes.extend_from_slice(MANIFEST_SIGNATURE_DOMAIN);
         bytes.extend_from_slice(&self.schema_version.to_be_bytes());
         bytes.extend_from_slice(vault_id);
@@ -507,7 +593,9 @@ impl SyncManifestV1 {
 fn canonical_tombstone_acknowledgements(
     mut acknowledgements: Vec<SyncTombstoneAckV1>,
 ) -> Result<Vec<SyncTombstoneAckV1>, MergeErrorV1> {
-    for acknowledgement in &acknowledgements { acknowledgement.validate()?; }
+    for acknowledgement in &acknowledgements {
+        acknowledgement.validate()?;
+    }
     acknowledgements.sort();
     acknowledgements.dedup();
     Ok(acknowledgements)
@@ -528,7 +616,10 @@ impl SyncHeadV1 {
     }
 
     pub fn new(revision: u64, head_hash: [u8; 32]) -> Self {
-        Self { revision, head_hash }
+        Self {
+            revision,
+            head_hash,
+        }
     }
 }
 
@@ -594,6 +685,57 @@ pub struct MergeConflictV1 {
 pub struct PendingPolicyConflictV1 {
     pub devices: Vec<String>,
     pub versions: Vec<u64>,
+    #[serde(skip)]
+    pub fields: Vec<String>,
+}
+
+pub struct CurrentPolicyFieldV1<'a> {
+    pub operation: &'a SyncOperationV1,
+    pub field: &'a str,
+    pub value: &'a Value,
+}
+
+pub fn latest_policy_fields<'a>(
+    operations: impl IntoIterator<Item = &'a SyncOperationV1>,
+) -> Result<Vec<CurrentPolicyFieldV1<'a>>, MergeErrorV1> {
+    let mut seen = BTreeMap::new();
+    let mut latest: BTreeMap<(&str, [u8; SYNC_ID_BYTES]), CurrentPolicyFieldV1<'a>> =
+        BTreeMap::new();
+    for (index, operation) in operations.into_iter().enumerate() {
+        if index >= MAX_MERGE_HISTORY {
+            return Err(MergeErrorV1::InvalidManifest);
+        }
+        if operation.kind != SyncOperationKindV1::PolicyChange {
+            continue;
+        }
+        operation.validate()?;
+        let device = decode_id(&operation.device_id)?;
+        match seen.insert((device, operation.counter), operation) {
+            Some(previous) if previous != operation => return Err(MergeErrorV1::OperationFork),
+            Some(_) => continue,
+            None => (),
+        }
+        for (field, value) in &operation.fields {
+            let key = (field.as_str(), device);
+            if latest
+                .get(&key)
+                .is_none_or(|previous| previous.operation.counter < operation.counter)
+            {
+                latest.insert(
+                    key,
+                    CurrentPolicyFieldV1 {
+                        operation,
+                        field,
+                        value,
+                    },
+                );
+                if latest.len() > MAX_MERGE_HISTORY {
+                    return Err(MergeErrorV1::InvalidManifest);
+                }
+            }
+        }
+    }
+    Ok(latest.into_values().collect())
 }
 
 pub struct MergeResultV1 {
@@ -620,41 +762,70 @@ pub fn merge_operations(
     local: &[SyncOperationV1],
     remote: &[SyncOperationV1],
 ) -> Result<MergeResultV1, MergeErrorV1> {
-    let operations = canonical_operations(local.iter().chain(remote).cloned().collect(), MAX_MERGE_HISTORY)?;
+    let operations = canonical_operations(
+        local.iter().chain(remote).cloned().collect(),
+        MAX_MERGE_HISTORY,
+    )?;
     let mut events: BTreeMap<([u8; SYNC_ID_BYTES], u64), EventCandidates> = BTreeMap::new();
     let mut bucket_descriptors = BTreeMap::<String, SyncBucketDescriptorV1>::new();
     let mut policies = Vec::new();
 
     for operation in &operations {
+        if operation.kind == SyncOperationKindV1::BackupForget {
+            continue;
+        }
         if operation.kind == SyncOperationKindV1::PolicyChange {
             policies.push(operation);
             continue;
         }
         if let Some(descriptor) = &operation.bucket_descriptor {
-            let bucket_id = operation.sync_bucket_id.as_ref().ok_or(MergeErrorV1::InvalidOperation)?;
-            if bucket_descriptors.get(bucket_id).is_some_and(|existing| existing != descriptor) {
+            let bucket_id = operation
+                .sync_bucket_id
+                .as_ref()
+                .ok_or(MergeErrorV1::InvalidOperation)?;
+            if bucket_descriptors
+                .get(bucket_id)
+                .is_some_and(|existing| existing != descriptor)
+            {
                 return Err(MergeErrorV1::BucketDescriptorFork);
             }
             bucket_descriptors.insert(bucket_id.clone(), descriptor.clone());
         }
         let device_id = decode_id(&operation.device_id)?;
         let origin_device_id = decode_id(&operation.origin_device_id)?;
-        let local_event_id = operation.local_event_id.ok_or(MergeErrorV1::InvalidOperation)?;
-        let sync_bucket_id = operation.sync_bucket_id.as_ref().ok_or(MergeErrorV1::InvalidOperation)?;
-        let event = events.entry((origin_device_id, local_event_id)).or_default();
-        if event.sync_bucket_id.as_ref().is_some_and(|existing| existing != sync_bucket_id) {
+        let local_event_id = operation
+            .local_event_id
+            .ok_or(MergeErrorV1::InvalidOperation)?;
+        let sync_bucket_id = operation
+            .sync_bucket_id
+            .as_ref()
+            .ok_or(MergeErrorV1::InvalidOperation)?;
+        let event = events
+            .entry((origin_device_id, local_event_id))
+            .or_default();
+        if event
+            .sync_bucket_id
+            .as_ref()
+            .is_some_and(|existing| existing != sync_bucket_id)
+        {
             return Err(MergeErrorV1::BucketIdentityFork);
         }
-        event.sync_bucket_id.get_or_insert_with(|| sync_bucket_id.clone());
+        event
+            .sync_bucket_id
+            .get_or_insert_with(|| sync_bucket_id.clone());
         if operation.kind == SyncOperationKindV1::Tombstone {
             event.tombstones.push((device_id, operation.counter));
         } else {
             for (field, value) in &operation.fields {
-                event.fields.entry(field.clone()).or_default().push(FieldCandidate {
-                    device_id,
-                    counter: operation.counter,
-                    value: value.clone(),
-                });
+                event
+                    .fields
+                    .entry(field.clone())
+                    .or_default()
+                    .push(FieldCandidate {
+                        device_id,
+                        counter: operation.counter,
+                        value: value.clone(),
+                    });
             }
         }
     }
@@ -664,9 +835,10 @@ pub fn merge_operations(
     let mut conflicts = Vec::new();
     for ((origin_device_id, local_event_id), event) in events {
         let sync_bucket_id = event.sync_bucket_id.ok_or(MergeErrorV1::InvalidOperation)?;
-        let tombstone = event.tombstones.iter().max_by(|left, right| {
-            left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0))
-        });
+        let tombstone = event
+            .tombstones
+            .iter()
+            .max_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
         let tombstone_counter = tombstone.map(|value| value.1);
         let resurrection = tombstone_counter.is_some_and(|counter| {
             operations.iter().any(|operation| {
@@ -681,9 +853,9 @@ pub fn merge_operations(
         for (field, mut candidates) in event.fields {
             candidates.sort_by(candidate_order);
             let winner = candidates.last().ok_or(MergeErrorV1::InvalidOperation)?;
-            let different_values = candidates
-                .iter()
-                .any(|candidate| candidate.device_id != winner.device_id && candidate.value != winner.value);
+            let different_values = candidates.iter().any(|candidate| {
+                candidate.device_id != winner.device_id && candidate.value != winner.value
+            });
             let tombstone_wins = tombstone_counter.is_some_and(|counter| counter >= winner.counter);
             if tombstone_wins {
                 if tombstone_counter == Some(winner.counter) {
@@ -778,7 +950,10 @@ pub struct SyncTombstoneAckProofV1 {
 
 impl SyncTombstoneAckProofV1 {
     pub fn new(active_verified_devices: Vec<String>, acknowledged_devices: Vec<String>) -> Self {
-        Self { active_verified_devices, acknowledged_devices }
+        Self {
+            active_verified_devices,
+            acknowledged_devices,
+        }
     }
 }
 
@@ -792,14 +967,19 @@ impl SyncTombstoneDeletionPermitV1 {
             return Err(MergeErrorV1::TombstoneNotAcknowledged);
         }
         for proof in tombstone_proofs {
-            if !tombstone_collectible(&proof.active_verified_devices, &proof.acknowledged_devices)? {
+            if !tombstone_collectible(&proof.active_verified_devices, &proof.acknowledged_devices)?
+            {
                 return Err(MergeErrorV1::TombstoneNotAcknowledged);
             }
         }
-        Ok(Self { object_id: object_id.to_owned() })
+        Ok(Self {
+            object_id: object_id.to_owned(),
+        })
     }
 
-    pub(crate) fn object_id(&self) -> &str { &self.object_id }
+    pub(crate) fn object_id(&self) -> &str {
+        &self.object_id
+    }
 }
 
 fn candidate_order(left: &FieldCandidate, right: &FieldCandidate) -> Ordering {
@@ -811,23 +991,42 @@ fn candidate_order(left: &FieldCandidate, right: &FieldCandidate) -> Ordering {
 fn policy_conflict(
     operations: &[&SyncOperationV1],
 ) -> Result<Option<PendingPolicyConflictV1>, MergeErrorV1> {
-    let Some(first) = operations.first() else {
-        return Ok(None);
-    };
-    if operations.iter().all(|operation| {
-        operation.policy_version == first.policy_version && operation.fields == first.fields
-    }) {
-        return Ok(None);
+    let current = latest_policy_fields(operations.iter().copied())?;
+    let mut by_field: BTreeMap<&str, Vec<&CurrentPolicyFieldV1<'_>>> = BTreeMap::new();
+    for candidate in &current {
+        by_field.entry(candidate.field).or_default().push(candidate);
     }
     let mut devices = BTreeSet::new();
     let mut versions = BTreeSet::new();
-    for operation in operations {
-        devices.insert((decode_id(&operation.device_id)?, operation.device_id.clone()));
-        versions.insert(operation.policy_version.ok_or(MergeErrorV1::InvalidOperation)?);
+    let mut fields = Vec::new();
+    for (field, candidates) in by_field {
+        if candidates
+            .iter()
+            .all(|candidate| candidate.value == candidates[0].value)
+        {
+            continue;
+        }
+        fields.push(field.to_owned());
+        for candidate in candidates {
+            let operation = candidate.operation;
+            devices.insert((
+                decode_id(&operation.device_id)?,
+                operation.device_id.clone(),
+            ));
+            versions.insert(
+                operation
+                    .policy_version
+                    .ok_or(MergeErrorV1::InvalidOperation)?,
+            );
+        }
+    }
+    if fields.is_empty() {
+        return Ok(None);
     }
     Ok(Some(PendingPolicyConflictV1 {
         devices: devices.into_iter().map(|(_, device)| device).collect(),
         versions: versions.into_iter().collect(),
+        fields,
     }))
 }
 

@@ -1,8 +1,6 @@
 use aw_models::Event;
 use chrono::Duration;
 
-use crate::sort_by_timestamp;
-
 /// Removes events not intersecting with the provided filter_events
 ///
 /// Usually used to filter buckets unaware if the user is making any activity with an bucket which
@@ -18,13 +16,22 @@ use crate::sort_by_timestamp;
 /// output:        [a    ]  [a ][b ]
 /// ```
 pub fn filter_period_intersect(events: Vec<Event>, filter_events: Vec<Event>) -> Vec<Event> {
+    filter_period_intersect_controlled(events, filter_events, &aw_models::QueryControl::unlimited())
+        .expect("unlimited intersection")
+}
+pub fn filter_period_intersect_controlled(
+    events: Vec<Event>,
+    filter_events: Vec<Event>,
+    control: &aw_models::QueryControl,
+) -> Result<Vec<Event>, aw_models::ReportExecutionErrorV1> {
+    control.checkpoint()?;
     if events.is_empty() || filter_events.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut filtered_events = Vec::new();
-    let events = sort_by_timestamp(events);
-    let filter_events = sort_by_timestamp(filter_events);
+    let events = crate::sort_by_timestamp_controlled(events, control)?;
+    let filter_events = crate::sort_by_timestamp_controlled(filter_events, control)?;
 
     let mut events_iter = events.into_iter();
     let mut filter_events_iter = filter_events.into_iter();
@@ -32,8 +39,9 @@ pub fn filter_period_intersect(events: Vec<Event>, filter_events: Vec<Event>) ->
     let mut cur_filter_event = filter_events_iter.next().unwrap();
 
     loop {
-        let event_endtime = cur_event.calculate_endtime();
-        let filter_endtime = cur_filter_event.calculate_endtime();
+        control.charge_fuel(1)?;
+        let event_endtime = crate::report_event_end(&cur_event, control)?;
+        let filter_endtime = crate::report_event_end(&cur_filter_event, control)?;
         if cur_event.duration == Duration::seconds(0) || event_endtime <= cur_filter_event.timestamp
         {
             match events_iter.next() {
@@ -41,19 +49,27 @@ pub fn filter_period_intersect(events: Vec<Event>, filter_events: Vec<Event>) ->
                     cur_event = e;
                     continue;
                 }
-                None => return filtered_events,
+                None => {
+                    control.checkpoint()?;
+                    return Ok(filtered_events);
+                }
             }
         }
-        if cur_event.timestamp >= cur_filter_event.calculate_endtime() {
+        if cur_event.timestamp >= crate::report_event_end(&cur_filter_event, control)? {
             match filter_events_iter.next() {
                 Some(e) => {
                     cur_filter_event = e;
                     continue;
                 }
-                None => return filtered_events,
+                None => {
+                    control.checkpoint()?;
+                    return Ok(filtered_events);
+                }
             }
         }
 
+        crate::report_merged_slot(filtered_events.len(), control)?;
+        control.charge_event_copy(&cur_event)?;
         let mut e = cur_event.clone();
         e.timestamp = std::cmp::max(e.timestamp, cur_filter_event.timestamp);
         let endtime = std::cmp::min(event_endtime, filter_endtime);

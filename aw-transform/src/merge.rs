@@ -41,41 +41,80 @@ use aw_models::Event;
 /// ```
 #[allow(clippy::map_entry)]
 pub fn merge_events_by_keys(events: Vec<Event>, keys: Vec<String>) -> Vec<Event> {
+    merge_events_by_keys_controlled(events, keys, &aw_models::QueryControl::unlimited())
+        .expect("unlimited grouping")
+}
+pub fn merge_events_by_keys_controlled(
+    events: Vec<Event>,
+    keys: Vec<String>,
+    control: &aw_models::QueryControl,
+) -> Result<Vec<Event>, aw_models::ReportExecutionErrorV1> {
+    control.checkpoint()?;
     if keys.is_empty() {
-        return vec![];
+        return Ok(Vec::new());
     }
-    let mut merged_events_map: HashMap<String, Event> = HashMap::new();
-    'event: for event in events {
-        let mut key_values = Vec::new();
+    let mut grouped: HashMap<String, Event> = HashMap::new();
+    'events: for mut event in events {
+        control.charge_fuel(1)?;
+        let mut values = Vec::new();
         for key in &keys {
-            match event.data.get(key) {
-                Some(v) => key_values.push(v.to_string()),
-                None => continue 'event,
-            }
-        }
-        let summed_key = key_values.join(".");
-        if merged_events_map.contains_key(&summed_key) {
-            let merged_event = merged_events_map.get_mut(&summed_key).unwrap();
-            merged_event.duration += event.duration;
-        } else {
-            let mut data = HashMap::new();
-            for key in &keys {
-                data.insert(key.clone(), event.data.get(key).unwrap());
-            }
-            let merged_event = Event {
-                id: None,
-                timestamp: event.timestamp,
-                duration: event.duration,
-                data: event.data.clone(),
+            control.charge_fuel(1)?;
+            let Some(value) = event.data.get(key) else {
+                continue 'events;
             };
-            merged_events_map.insert(summed_key, merged_event);
+            control.charge_json_copy(value)?;
+            // Admit encoded grouping keys before allocating their strings.
+            struct Count(usize);
+            impl std::io::Write for Count {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    self.0 = self
+                        .0
+                        .checked_add(b.len())
+                        .ok_or_else(|| std::io::Error::other("report limit"))?;
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut count = Count(0);
+            serde_json::to_writer(&mut count, value)
+                .map_err(|_| aw_models::ReportExecutionErrorV1::DataIntegrity)?;
+            control.charge_values(1)?;
+            control.charge_bytes((count.0 + std::mem::size_of::<String>()) as u64)?;
+            values.push(
+                serde_json::to_string(value)
+                    .map_err(|_| aw_models::ReportExecutionErrorV1::DataIntegrity)?,
+            );
+        }
+        let size = values
+            .iter()
+            .try_fold(values.len().saturating_sub(1), |total, value| {
+                total.checked_add(value.len())
+            })
+            .ok_or(aw_models::ReportExecutionErrorV1::ByteLimit)?;
+        control.charge_bytes(size as u64)?;
+        let key = values.join(".");
+        if let Some(previous) = grouped.get_mut(&key) {
+            previous.duration = previous
+                .duration
+                .checked_add(&event.duration)
+                .ok_or(aw_models::ReportExecutionErrorV1::DataIntegrity)?;
+        } else {
+            crate::report_merged_slot(grouped.len(), control)?;
+            control.charge_bytes(std::mem::size_of::<String>() as u64)?;
+            event.id = None;
+            grouped.insert(key, event);
         }
     }
-    let mut merged_events_list = Vec::new();
-    for (_key, event) in merged_events_map.drain() {
-        merged_events_list.push(event);
+    let mut output = Vec::new();
+    for (_, event) in grouped {
+        control.charge_fuel(1)?;
+        crate::report_event_slot(control)?;
+        output.push(event);
     }
-    merged_events_list
+    control.checkpoint()?;
+    Ok(output)
 }
 
 #[cfg(test)]

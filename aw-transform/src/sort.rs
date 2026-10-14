@@ -1,15 +1,43 @@
 use aw_models::Event;
 
 /// Sort a list of events by timestamp
-pub fn sort_by_timestamp(mut events: Vec<Event>) -> Vec<Event> {
-    events.sort_by_key(|e1| e1.timestamp);
-    events
+pub fn sort_by_timestamp(events: Vec<Event>) -> Vec<Event> {
+    sort_by_timestamp_controlled(events, &aw_models::QueryControl::unlimited())
+        .expect("unlimited timestamp sort")
 }
-
-/// Sort a list of events by duration with the highest duration first
-pub fn sort_by_duration(mut events: Vec<Event>) -> Vec<Event> {
-    events.sort_by(|e1, e2| e2.duration.cmp(&e1.duration));
-    events
+pub fn sort_by_duration(events: Vec<Event>) -> Vec<Event> {
+    sort_by_duration_controlled(events, &aw_models::QueryControl::unlimited())
+        .expect("unlimited duration sort")
+}
+fn sort_admission(
+    length: usize,
+    control: &aw_models::QueryControl,
+) -> Result<(), aw_models::ReportExecutionErrorV1> {
+    control.charge_bytes((length * std::mem::size_of::<Event>()) as u64)?;
+    let levels = if length < 2 {
+        0
+    } else {
+        usize::BITS - (length - 1).leading_zeros()
+    };
+    control.charge_fuel((length as u64) * (levels as u64 + 1))
+}
+pub fn sort_by_timestamp_controlled(
+    mut events: Vec<Event>,
+    control: &aw_models::QueryControl,
+) -> Result<Vec<Event>, aw_models::ReportExecutionErrorV1> {
+    sort_admission(events.len(), control)?;
+    events.sort_by_key(|e| e.timestamp);
+    control.checkpoint()?;
+    Ok(events)
+}
+pub fn sort_by_duration_controlled(
+    mut events: Vec<Event>,
+    control: &aw_models::QueryControl,
+) -> Result<Vec<Event>, aw_models::ReportExecutionErrorV1> {
+    sort_admission(events.len(), control)?;
+    events.sort_by(|a, b| b.duration.cmp(&a.duration));
+    control.checkpoint()?;
+    Ok(events)
 }
 
 #[cfg(test)]

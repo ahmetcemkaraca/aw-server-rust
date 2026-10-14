@@ -31,6 +31,7 @@ use super::DatastoreError;
 use crate::EgressSecrets;
 pub(crate) const AI_SETTINGS_KEY: &str = "settings.ai.v1";
 pub(crate) const AI_HISTORY_KEY: &str = "settings.ai.history.v1";
+
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
 use crate::SyncDeviceIdentity;
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
@@ -49,6 +50,22 @@ use aw_sync_e2ee::{
     decode_sync_data_field_v1, encode_sync_data_field_v1, merge_operations,
     ManifestDecisionV1, SyncHeadV1, SyncOperationV1,
 };
+
+pub(crate) fn event_storage_times(event: &Event) -> Result<(i64, i64), DatastoreError> {
+    let start = event
+        .timestamp
+        .timestamp_nanos_opt()
+        .ok_or(DatastoreError::InvalidTimeRange)?;
+    let duration = event
+        .duration
+        .num_nanoseconds()
+        .filter(|value| *value >= 0)
+        .ok_or(DatastoreError::InvalidTimeRange)?;
+    let end = start
+        .checked_add(duration)
+        .ok_or(DatastoreError::InvalidTimeRange)?;
+    Ok((start, end))
+}
 
 fn _get_db_version(conn: &Connection) -> i32 {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
@@ -179,8 +196,9 @@ fn validate_egress_user_policy(user: &EgressUserPolicyV1) -> Result<(), Datastor
  * 12: Added schema-checked plugin-owned annotation events
  * 13: Added installed packages, one-time write approvals and content-free access history
  * 14: Added scoped pending action queue; old pending approvals are invalidated
+ * 15: Added protected historical backup deletion facts and object markers
  */
-static NEWEST_DB_VERSION: i32 = 14;
+static NEWEST_DB_VERSION: i32 = 16;
 const EGRESS_KILL_SWITCH_KEY: &str = "egress.kill_switch";
 const EGRESS_ALIAS_SECRET_KEY: &str = "egress.alias_secret";
 const EGRESS_APPROVAL_SECRET_KEY: &str = "egress.approval_secret";
@@ -265,6 +283,17 @@ fn _create_tables(conn: &Connection, version: i32, encrypted: bool) -> bool {
             PRAGMA user_version = 14; COMMIT;").expect("Failed to add plugin pending action queue");
     }
 
+    if version < 15 {
+        conn.execute_batch("BEGIN EXCLUSIVE TRANSACTION;
+            CREATE TABLE sync_backup_deletions(vault_id TEXT NOT NULL,key_epoch TEXT NOT NULL,snapshot_id TEXT NOT NULL,bundle_sha256 TEXT NOT NULL,fact_json TEXT NOT NULL,deleted_at TEXT NOT NULL,PRIMARY KEY(vault_id,key_epoch,snapshot_id,bundle_sha256),UNIQUE(vault_id,key_epoch,snapshot_id));
+            CREATE TABLE sync_backup_deleted_objects(object_id TEXT PRIMARY KEY,envelope_sha256 TEXT NOT NULL,vault_id TEXT NOT NULL,key_epoch TEXT NOT NULL,snapshot_id TEXT NOT NULL,bundle_sha256 TEXT NOT NULL,FOREIGN KEY(vault_id,key_epoch,snapshot_id,bundle_sha256) REFERENCES sync_backup_deletions(vault_id,key_epoch,snapshot_id,bundle_sha256));
+            PRAGMA user_version = 15; COMMIT;").expect("Failed to add protected backup deletion state");
+    }
+    if version < 16 {
+        conn.execute_batch("BEGIN EXCLUSIVE TRANSACTION;
+            ALTER TABLE sync_backup_deletions ADD COLUMN sealed_record_json TEXT;
+            PRAGMA user_version = 16; COMMIT;").expect("Failed to add protected backup retry record");
+    }
     first_init
 }
 
@@ -714,14 +743,31 @@ pub struct DatastoreInstance {
     buckets_cache: HashMap<String, Bucket>,
     first_init: bool,
     pub db_version: i32,
+    pub(crate) encrypted: bool,
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub(crate) policy_context: [u8; 32],
 }
 
 impl DatastoreInstance {
-    pub fn new(
+    pub(crate) fn new_readonly_backup_ledger(conn: &Connection) -> Result<Self, DatastoreError> {
+        Self::new_with_backup_compatibility(conn, false, true, true)
+    }
+    pub fn new(conn: &Connection, migrate_enabled: bool, encrypted: bool) -> Result<Self, DatastoreError> {
+        Self::new_with_backup_compatibility(conn, migrate_enabled, encrypted, false)
+    }
+    fn new_with_backup_compatibility(
         conn: &Connection,
         migrate_enabled: bool,
         encrypted: bool,
+        backup_compatibility: bool,
     ) -> Result<DatastoreInstance, DatastoreError> {
+        #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+        let policy_context = {
+            let mut context = [0_u8; 32];
+            SystemRandom::new().fill(&mut context)
+                .map_err(|_| DatastoreError::InternalError("Policy context is unavailable".into()))?;
+            context
+        };
         let mut first_init = false;
         let db_version = _get_db_version(conn);
 
@@ -731,7 +777,7 @@ impl DatastoreInstance {
             return Err(DatastoreError::Uninitialized(
                 "Tried to open an uninitialized datastore with migration disabled".to_string(),
             ));
-        } else if db_version != NEWEST_DB_VERSION {
+        } else if db_version != NEWEST_DB_VERSION && !(backup_compatibility && db_version == 15) {
             return Err(DatastoreError::OldDbVersion(format!(
                 "\
                 Tried to open an database with an incompatible database version!
@@ -743,6 +789,9 @@ impl DatastoreInstance {
             buckets_cache: HashMap::new(),
             first_init,
             db_version,
+            encrypted,
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            policy_context,
         };
         ds.get_stored_buckets(conn)?;
         Ok(ds)
@@ -769,24 +818,10 @@ impl DatastoreInstance {
         };
         let buckets = match stmt.query_map(&[] as &[&dyn ToSql], |row| {
             let opt_start_ns: Option<i64> = row.get(6)?;
-            let opt_start = match opt_start_ns {
-                Some(starttime_ns) => {
-                    let seconds: i64 = starttime_ns / 1_000_000_000;
-                    let subnanos: u32 = (starttime_ns % 1_000_000_000) as u32;
-                    Some(DateTime::from_timestamp(seconds, subnanos).unwrap())
-                }
-                None => None,
-            };
+            let opt_start = opt_start_ns.map(DateTime::from_timestamp_nanos);
 
             let opt_end_ns: Option<i64> = row.get(7)?;
-            let opt_end = match opt_end_ns {
-                Some(endtime_ns) => {
-                    let seconds: i64 = endtime_ns / 1_000_000_000;
-                    let subnanos: u32 = (endtime_ns % 1_000_000_000) as u32;
-                    Some(DateTime::from_timestamp(seconds, subnanos).unwrap())
-                }
-                None => None,
-            };
+            let opt_end = opt_end_ns.map(DateTime::from_timestamp_nanos);
 
             // If data column is not set (possible on old installations), use an empty map as default
             let data_str: String = row.get(8)?;
@@ -867,65 +902,76 @@ impl DatastoreInstance {
         conn: &Connection,
         mut bucket: Bucket,
     ) -> Result<(), DatastoreError> {
-        bucket.created = match bucket.created {
-            Some(created) => Some(created),
-            None => Some(Utc::now()),
-        };
-        let mut stmt = match conn.prepare_cached(
-            "
+        if let Some(events) = &bucket.events {
+            for event in events.iter() {
+                event_storage_times(event)?;
+            }
+        }
+        let result = with_savepoint(conn, "peakactivity_create_bucket", || {
+            bucket.created = match bucket.created {
+                Some(created) => Some(created),
+                None => Some(Utc::now()),
+            };
+            let mut stmt = match conn.prepare_cached(
+                "
                 INSERT INTO buckets (name, type, client, hostname, created, data)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        ) {
-            Ok(buckets) => buckets,
-            Err(err) => {
-                return Err(DatastoreError::InternalError(format!(
-                    "Failed to prepare create_bucket SQL statement: {err}"
-                )))
-            }
-        };
-        let data = serde_json::to_string(&bucket.data).unwrap();
-        let res = stmt.execute([
-            &bucket.id,
-            &bucket._type,
-            &bucket.client,
-            &bucket.hostname,
-            &bucket.created as &dyn ToSql,
-            &data,
-        ]);
-
-        match res {
-            Ok(_) => {
-                info!("Created bucket {}", bucket.id);
-                // Get and set rowid
-                let rowid: i64 = conn.last_insert_rowid();
-                bucket.bid = Some(rowid);
-                // Take out events from struct before caching
-                let events = bucket.events;
-                bucket.events = None;
-                // Cache bucket
-                self.buckets_cache.insert(bucket.id.clone(), bucket.clone());
-                // Insert events
-                if let Some(events) = events {
-                    self.insert_events(conn, &bucket.id, events.take_inner())?;
-                    bucket.events = None;
+            ) {
+                Ok(buckets) => buckets,
+                Err(err) => {
+                    return Err(DatastoreError::InternalError(format!(
+                        "Failed to prepare create_bucket SQL statement: {err}"
+                    )))
                 }
-                Ok(())
-            }
-            // FIXME: This match is ugly, is it possible to write it in a cleaner way?
-            Err(err) => match err {
-                rusqlite::Error::SqliteFailure { 0: sqlerr, 1: _ } => match sqlerr.code {
-                    rusqlite::ErrorCode::ConstraintViolation => {
-                        Err(DatastoreError::BucketAlreadyExists(bucket.id.to_string()))
+            };
+            let data = serde_json::to_string(&bucket.data).unwrap();
+            let res = stmt.execute([
+                &bucket.id,
+                &bucket._type,
+                &bucket.client,
+                &bucket.hostname,
+                &bucket.created as &dyn ToSql,
+                &data,
+            ]);
+
+            match res {
+                Ok(_) => {
+                    // Get and set rowid
+                    let rowid: i64 = conn.last_insert_rowid();
+                    bucket.bid = Some(rowid);
+                    // Take out events from struct before caching
+                    let events = bucket.events.take();
+                    // Cache bucket
+                    self.buckets_cache.insert(bucket.id.clone(), bucket.clone());
+                    // Insert events
+                    if let Some(events) = events {
+                        self.insert_events(conn, &bucket.id, events.take_inner())?;
                     }
+                    Ok(())
+                }
+                // FIXME: This match is ugly, is it possible to write it in a cleaner way?
+                Err(err) => match err {
+                    rusqlite::Error::SqliteFailure { 0: sqlerr, 1: _ } => match sqlerr.code {
+                        rusqlite::ErrorCode::ConstraintViolation => {
+                            Err(DatastoreError::BucketAlreadyExists(bucket.id.to_string()))
+                        }
+                        _ => Err(DatastoreError::InternalError(format!(
+                            "Failed to execute create_bucket SQL statement: {err}"
+                        ))),
+                    },
                     _ => Err(DatastoreError::InternalError(format!(
                         "Failed to execute create_bucket SQL statement: {err}"
                     ))),
                 },
-                _ => Err(DatastoreError::InternalError(format!(
-                    "Failed to execute create_bucket SQL statement: {err}"
-                ))),
-            },
+            }
+        });
+        if result.is_err() {
+            self.reload_buckets(conn)?;
         }
+        if result.is_ok() {
+            info!("Created bucket {}", bucket.id);
+        }
+        result
     }
 
     pub fn delete_bucket(
@@ -937,8 +983,14 @@ impl DatastoreInstance {
         let bucketrow = bucket.bid.unwrap();
         with_savepoint(conn, "peakactivity_delete_bucket", || {
             #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-            for event in self.get_events_unclipped(conn, bucket_id, None, None, None)? {
-                self.record_local_tombstone(conn, bucket_id, &event)?;
+            {
+                let mut stmt = conn.prepare_cached("SELECT id FROM events WHERE bucketrow = ?1 ORDER BY starttime DESC, id DESC")
+                    .map_err(|_| DatastoreError::InternalError("Could not inspect deleted events".into()))?;
+                let ids = stmt.query_map([bucketrow], |row| row.get::<_, i64>(0))
+                    .map_err(|_| DatastoreError::InternalError("Could not inspect deleted events".into()))?;
+                for id in ids {
+                    self.record_local_tombstone(conn, bucket_id, id.map_err(|_| DatastoreError::InternalError("Could not inspect deleted events".into()))?)?;
+                }
             }
             conn.execute("DELETE FROM event_corrections WHERE bucketrow = ?1", [&bucketrow])
                 .map_err(|_| DatastoreError::InternalError("Failed to delete correction history".into()))?;
@@ -988,11 +1040,7 @@ impl DatastoreInstance {
                 "INSERT OR REPLACE INTO events(bucketrow,id,starttime,endtime,data) VALUES (?1,?2,?3,?4,?5)",
             ).map_err(|err| DatastoreError::InternalError(format!("Failed to prepare insert_events SQL statement: {err}")))?;
             for event in &mut events {
-                let starttime_nanos = event.timestamp.timestamp_nanos_opt().unwrap();
-                let duration_nanos = event.duration.num_nanoseconds().ok_or_else(|| {
-                    DatastoreError::InternalError("Failed to convert duration to nanoseconds".into())
-                })?;
-                let endtime_nanos = starttime_nanos + duration_nanos;
+                let (starttime_nanos, endtime_nanos) = event_storage_times(event)?;
                 let data = serde_json::to_string(&event.data).unwrap();
                 stmt.execute([
                     &bucket.bid.unwrap(),
@@ -1029,8 +1077,7 @@ impl DatastoreInstance {
                     |_| Ok(()),
                 ).optional().map_err(|_| DatastoreError::InternalError("Could not inspect deleted events".into()))?.is_some();
                 if exists {
-                    let event = self.get_event(conn, bucket_id, *id)?;
-                    self.record_local_tombstone(conn, bucket_id, &event)?;
+                    self.record_local_tombstone(conn, bucket_id, *id)?;
                 }
             }
             let mut correction_stmt = conn.prepare_cached(
@@ -1065,8 +1112,14 @@ impl DatastoreInstance {
         let bucketrow = bucket.bid.unwrap();
         let removed = with_savepoint(conn, "peakactivity_delete_range", || {
             #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-            for event in self.get_events_unclipped(conn, bucket_id, Some(start), Some(end), None)? {
-                self.record_local_tombstone(conn, bucket_id, &event)?;
+            {
+                let mut stmt = conn.prepare_cached("SELECT id FROM events WHERE bucketrow = ?1 AND endtime >= ?2 AND starttime <= ?3 ORDER BY starttime DESC, id DESC")
+                    .map_err(|_| DatastoreError::InternalError("Could not inspect deleted events".into()))?;
+                let ids = stmt.query_map([bucketrow, start_ns, end_ns], |row| row.get::<_, i64>(0))
+                    .map_err(|_| DatastoreError::InternalError("Could not inspect deleted events".into()))?;
+                for id in ids {
+                    self.record_local_tombstone(conn, bucket_id, id.map_err(|_| DatastoreError::InternalError("Could not inspect deleted events".into()))?)?;
+                }
             }
             conn.execute(
                 "DELETE FROM event_corrections WHERE bucketrow = ?1 AND event_id IN (SELECT id FROM events WHERE bucketrow = ?1 AND endtime >= ?2 AND starttime <= ?3)",
@@ -1130,10 +1183,7 @@ impl DatastoreInstance {
         corrected.id = Some(event_id);
 
         let result = with_savepoint(conn, "peakactivity_replace_last_event", || {
-            let starttime_nanos = corrected.timestamp.timestamp_nanos_opt().unwrap();
-            let duration_nanos = corrected.duration.num_nanoseconds()
-                .ok_or_else(|| DatastoreError::InternalError("Failed to convert duration to nanoseconds".into()))?;
-            let endtime_nanos = starttime_nanos + duration_nanos;
+            let (starttime_nanos, endtime_nanos) = event_storage_times(&corrected)?;
             let data = serde_json::to_string(&corrected.data).unwrap();
             let changed = conn.execute(
                 "UPDATE events SET starttime = ?2,endtime = ?3,data = ?4 WHERE bucketrow = ?1 AND id = ?5",
@@ -1161,6 +1211,7 @@ impl DatastoreInstance {
         last_heartbeat: &mut HashMap<String, Option<Event>>,
     ) -> Result<Event, DatastoreError> {
         self.get_bucket(bucket_id)?;
+        event_storage_times(&heartbeat)?;
         if !last_heartbeat.contains_key(bucket_id) {
             last_heartbeat.insert(bucket_id.to_string(), None);
         }
@@ -1180,6 +1231,7 @@ impl DatastoreInstance {
                 }
             }
         };
+        event_storage_times(&last_event)?;
         let inserted_heartbeat = match aw_transform::heartbeat(&last_event, &heartbeat, pulsetime) {
             Some(mut merged_heartbeat) => {
                 debug!("Merged heartbeat successfully");
@@ -1237,15 +1289,14 @@ impl DatastoreInstance {
             let endtime_ns: i64 = row.get(2)?;
             let data_str: String = row.get(3)?;
 
-            let time_seconds: i64 = starttime_ns / 1_000_000_000;
-            let time_subnanos: u32 = (starttime_ns % 1_000_000_000) as u32;
-            let duration_ns = endtime_ns - starttime_ns;
+            let duration_ns = endtime_ns.checked_sub(starttime_ns)
+                .filter(|duration| *duration >= 0).ok_or(rusqlite::Error::InvalidQuery)?;
             let data: serde_json::map::Map<String, Value> =
-                serde_json::from_str(&data_str).unwrap();
+                serde_json::from_str(&data_str).map_err(|_| rusqlite::Error::InvalidQuery)?;
 
             Ok(Event {
                 id: Some(id),
-                timestamp: DateTime::from_timestamp(time_seconds, time_subnanos).unwrap(),
+                timestamp: DateTime::from_timestamp_nanos(starttime_ns),
                 duration: Duration::nanoseconds(duration_ns),
                 data,
             })
@@ -1296,8 +1347,7 @@ impl DatastoreInstance {
             for id in old_ids {
                 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
                 {
-                    let event = self.get_event(conn, bucket_id, *id)?;
-                    self.record_local_tombstone(conn, bucket_id, &event)?;
+                    self.record_local_tombstone(conn, bucket_id, *id)?;
                 }
                 conn.execute(
                     "DELETE FROM event_corrections WHERE bucketrow = ?1 AND event_id = ?2",
@@ -1426,6 +1476,34 @@ impl DatastoreInstance {
             .map_err(|_| DatastoreError::InternalError("Correction history could not be read".into()))
     }
 
+    pub(crate) fn read_report_events(
+        conn:&Connection,bucketrow:i64,start_ns:i64,end_ns:i64,control:&aw_models::QueryControl,
+    )->Result<Vec<Event>,aw_models::ReportExecutionErrorV1> {
+        use aw_models::{ReportExecutionErrorV1 as Error,QueryLimits};
+        let error=|_|control.checkpoint().err().unwrap_or(Error::DataIntegrity);
+        let mut statement=conn.prepare("SELECT id,starttime,endtime,data FROM events
+            WHERE bucketrow=?1 AND endtime>=?2 AND starttime<=?3
+            ORDER BY starttime DESC,id DESC LIMIT ?4").map_err(error)?;
+        let mut rows=statement.query(rusqlite::params![bucketrow,start_ns,end_ns,QueryLimits::MANAGED.max_source_rows+1]).map_err(error)?;
+        let mut events=Vec::new();
+        while let Some(row)=rows.next().map_err(error)? {
+            control.checkpoint()?;
+            if events.len() as u64==QueryLimits::MANAGED.max_source_rows {return Err(Error::RowLimit);}
+            control.charge_rows(1)?;control.charge_fuel(1)?;
+            let id:i64=row.get(0).map_err(error)?;
+            let start:i64=row.get(1).map_err(error)?;
+            let end:i64=row.get(2).map_err(error)?;
+            let duration=end.checked_sub(start).filter(|ns|*ns>=0).ok_or(Error::DataIntegrity)?;
+            let borrowed=row.get_ref(3).map_err(error)?.as_str().map_err(|_|Error::DataIntegrity)?;
+            if borrowed.len()>QueryLimits::MANAGED.max_event_json_bytes {return Err(Error::ByteLimit);}
+            control.charge_values(1)?;control.charge_bytes(std::mem::size_of::<Event>() as u64)?;
+            let serde_json::Value::Object(data)=crate::reports::decode_json(borrowed,control)? else {return Err(Error::DataIntegrity);};
+            let mut event=Event::new(DateTime::<Utc>::from_timestamp_nanos(start),Duration::nanoseconds(duration),data);
+            event.id=Some(id);events.push(event);
+        }
+        control.checkpoint()?;Ok(events)
+    }
+
     fn get_events_inner(
         &mut self,
         conn: &Connection,
@@ -1440,12 +1518,12 @@ impl DatastoreInstance {
         let mut list = Vec::new();
 
         let starttime_filter_ns: i64 = match starttime_opt {
-            Some(dt) => dt.timestamp_nanos_opt().unwrap(),
-            None => 0,
+            Some(dt) => dt.timestamp_nanos_opt().ok_or(DatastoreError::InvalidTimeRange)?,
+            None => i64::MIN,
         };
         let endtime_filter_ns: i64 = match endtime_opt {
-            Some(dt) => dt.timestamp_nanos_opt().unwrap(),
-            None => std::i64::MAX,
+            Some(dt) => dt.timestamp_nanos_opt().ok_or(DatastoreError::InvalidTimeRange)?,
+            None => i64::MAX,
         };
         if starttime_filter_ns > endtime_filter_ns {
             warn!("Starttime in event query was lower than endtime!");
@@ -1488,24 +1566,26 @@ impl DatastoreInstance {
                 let mut endtime_ns: i64 = row.get(2)?;
                 let data_str: String = row.get(3)?;
 
-                if clip_to_query_range {
+                let stored_duration_ns = endtime_ns.checked_sub(starttime_ns)
+                    .filter(|duration| *duration >= 0).ok_or(rusqlite::Error::InvalidQuery)?;
+                let duration_ns = if clip_to_query_range {
                     if starttime_ns < starttime_filter_ns {
                         starttime_ns = starttime_filter_ns
                     }
                     if endtime_ns > endtime_filter_ns {
                         endtime_ns = endtime_filter_ns
                     }
-                }
-                let duration_ns = endtime_ns - starttime_ns;
+                    endtime_ns - starttime_ns
+                } else {
+                    stored_duration_ns
+                };
 
-                let time_seconds: i64 = starttime_ns / 1_000_000_000;
-                let time_subnanos: u32 = (starttime_ns % 1_000_000_000) as u32;
                 let data: serde_json::map::Map<String, Value> =
-                    serde_json::from_str(&data_str).unwrap();
+                    serde_json::from_str(&data_str).map_err(|_| rusqlite::Error::InvalidQuery)?;
 
                 Ok(Event {
                     id: Some(id),
-                    timestamp: DateTime::from_timestamp(time_seconds, time_subnanos).unwrap(),
+                    timestamp: DateTime::from_timestamp_nanos(starttime_ns),
                     duration: Duration::nanoseconds(duration_ns),
                     data,
                 })
@@ -1519,10 +1599,7 @@ impl DatastoreInstance {
             }
         };
         for row in rows {
-            match row {
-                Ok(event) => list.push(event),
-                Err(err) => warn!("Corrupt event in bucket {}: {}", bucket_id, err),
-            };
+            list.push(row.map_err(|_| DatastoreError::InternalError("Stored events could not be read".into()))?);
         }
 
         Ok(list)
@@ -1567,12 +1644,12 @@ impl DatastoreInstance {
         let bucket = self.get_bucket(bucket_id)?;
 
         let starttime_filter_ns: i64 = match starttime_opt {
-            Some(dt) => dt.timestamp_nanos_opt().unwrap(),
-            None => 0,
+            Some(dt) => dt.timestamp_nanos_opt().ok_or(DatastoreError::InvalidTimeRange)?,
+            None => i64::MIN,
         };
         let endtime_filter_ns: i64 = match endtime_opt {
-            Some(dt) => dt.timestamp_nanos_opt().unwrap(),
-            None => std::i64::MAX,
+            Some(dt) => dt.timestamp_nanos_opt().ok_or(DatastoreError::InvalidTimeRange)?,
+            None => i64::MAX,
         };
         if starttime_filter_ns >= endtime_filter_ns {
             warn!("Endtime in event query was same or lower than starttime!");
@@ -1619,6 +1696,15 @@ impl DatastoreInstance {
         key: &str,
         data: &str,
     ) -> Result<(), DatastoreError> {
+        #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+        {
+            return crate::sync_policy::mutate_key(self, conn, key, || self.insert_key_value_raw(conn, key, data));
+        }
+        #[cfg(not(any(feature = "encryption", feature = "encryption-vendored")))]
+        self.insert_key_value_raw(conn, key, data)
+    }
+
+    fn insert_key_value_raw(&self, conn: &Connection, key: &str, data: &str) -> Result<(), DatastoreError> {
         let mut stmt = match conn.prepare_cached(
             "
                 INSERT OR REPLACE INTO key_value(key, value, last_modified)
@@ -1632,16 +1718,21 @@ impl DatastoreInstance {
             }
         };
         let timestamp = Utc::now().timestamp();
-        #[allow(clippy::expect_fun_call)]
         stmt.execute(params![key, data, &timestamp])
-            .expect(&format!("Failed to insert key-value pair: {key}"));
+            .map_err(|_| DatastoreError::InternalError("Could not save local settings".into()))?;
         Ok(())
     }
 
     pub fn delete_key_value(&self, conn: &Connection, key: &str) -> Result<(), DatastoreError> {
-        conn.execute("DELETE FROM key_value WHERE key = ?1", [key])
-            .expect("Error deleting value from database");
-        Ok(())
+        let remove = || {
+            conn.execute("DELETE FROM key_value WHERE key = ?1", [key])
+                .map_err(|_| DatastoreError::InternalError("Could not delete local settings".into()))?;
+            Ok(())
+        };
+        #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+        { return crate::sync_policy::mutate_key(self, conn, key, remove); }
+        #[cfg(not(any(feature = "encryption", feature = "encryption-vendored")))]
+        remove()
     }
 
     pub fn get_key_value(&self, conn: &Connection, key: &str) -> Result<String, DatastoreError> {
@@ -1969,7 +2060,7 @@ impl DatastoreInstance {
     }
 
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-    fn sync_journal_active(&self, conn: &Connection) -> Result<bool, DatastoreError> {
+    pub(crate) fn sync_journal_active(&self, conn: &Connection) -> Result<bool, DatastoreError> {
         conn.query_row("SELECT active FROM sync_journal_state WHERE id = 1", [], |row| row.get(0))
             .optional()
             .map(|active: Option<bool>| active.unwrap_or(false))
@@ -1986,7 +2077,7 @@ impl DatastoreInstance {
     }
 
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-    fn local_sync_writer(&self, conn: &Connection) -> Result<([u8; 16], u64), DatastoreError> {
+    pub(crate) fn local_sync_writer(&self, conn: &Connection) -> Result<([u8; 16], u64), DatastoreError> {
         let identity = self.get_sync_device_identity(conn)?
             .ok_or_else(|| DatastoreError::InternalError("Create a local sync identity before preparing sync".into()))?;
         let material = self.get_sync_key_material(conn)?
@@ -2138,7 +2229,7 @@ impl DatastoreInstance {
     }
 
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-    fn store_local_sync_operation(
+    pub(crate) fn store_local_sync_operation(
         &self,
         conn: &Connection,
         device_id: [u8; 16],
@@ -2217,10 +2308,9 @@ impl DatastoreInstance {
     }
 
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-    fn record_local_tombstone(&self, conn: &Connection, bucket_id: &str, event: &Event) -> Result<(), DatastoreError> {
+    fn record_local_tombstone(&self, conn: &Connection, bucket_id: &str, local_event_id: i64) -> Result<(), DatastoreError> {
         if !self.sync_journal_active(conn)? { return Ok(()); }
         let (device_id, key_epoch) = self.local_sync_writer(conn)?;
-        let local_event_id = event.id.ok_or_else(|| DatastoreError::InternalError("Deleted event has no local ID".into()))?;
         let (sync_bucket_id, _) = self.ensure_local_sync_bucket(conn, bucket_id)?;
         let (origin_device, origin_event) = self.ensure_local_sync_event_mapping(conn, &device_id, bucket_id, local_event_id, &sync_bucket_id)?;
         let counter = self.next_sync_operation_counter(conn, &device_id)?;
@@ -2249,6 +2339,7 @@ impl DatastoreInstance {
             .ok().filter(|epoch| *epoch > 0)
             .ok_or_else(|| DatastoreError::InternalError("Invalid sync baseline epoch".into()))?;
         with_savepoint(conn, "sync_baseline_begin", || {
+            self.flush_pending_backup_forgets(conn)?;
             let existing = conn.query_row(
                 "SELECT active,key_epoch,baseline_max_event_id,baseline_cursor,baseline_complete FROM sync_journal_state WHERE id = 1",
                 [],
@@ -2264,6 +2355,7 @@ impl DatastoreInstance {
                         params![key_epoch_db, watermark, complete],
                     )
                     .map_err(|_| DatastoreError::InternalError("Sync baseline could not restart for the new key epoch".into()))?;
+                    crate::sync_policy::seed_current(self, conn)?;
                 return Ok(SyncBaselineProgressV1 {
                     key_epoch,
                     baseline_max_event_id: u64::try_from(watermark).map_err(|_| DatastoreError::InternalError("Sync baseline watermark is invalid".into()))?,
@@ -2289,6 +2381,7 @@ impl DatastoreInstance {
                 "INSERT INTO sync_journal_state(id,active,key_epoch,baseline_max_event_id,baseline_cursor,baseline_complete) VALUES (1,1,?1,?2,0,?3)",
                 params![key_epoch_db, watermark, complete],
             ).map_err(|_| DatastoreError::InternalError("Sync baseline could not start".into()))?;
+            crate::sync_policy::seed_current(self, conn)?;
             Ok(SyncBaselineProgressV1 {
                 key_epoch,
                 baseline_max_event_id: u64::try_from(watermark).map_err(|_| DatastoreError::InternalError("Sync baseline watermark is invalid".into()))?,
@@ -2444,6 +2537,7 @@ impl DatastoreInstance {
 
             for operation in &manifest.operations {
                 operation.validate().map_err(|_| DatastoreError::InternalError("Remote sync operation is invalid".into()))?;
+                crate::sync_policy::validate_operation(operation)?;
                 let actor = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&operation.device_id)
                     .map_err(|_| DatastoreError::InternalError("Remote sync writer is invalid".into()))?;
                 if actor.as_slice() != &writer_device_id[..] {
@@ -2474,6 +2568,9 @@ impl DatastoreInstance {
             }
 
             let operations = self.all_sync_operations_for_epoch(conn, key_epoch)?;
+            let forgets=aw_sync_e2ee::assemble_backup_forget_operations(&operations).map_err(|_|DatastoreError::InternalError("Remote backup forget fragments are invalid or incomplete history exceeds its bound".into()))?;
+            let context:String=self.policy_context.iter().map(|b|format!("{b:02x}")).collect();
+            self.merge_sync_backup_deletions(conn,&context,&forgets,&Utc::now().to_rfc3339())?;
             let merged = merge_operations(&[], &operations)
                 .map_err(|_| DatastoreError::InternalError("Stored sync operations could not be merged".into()))?;
             let mut known_tombstones = BTreeSet::new();
@@ -2874,7 +2971,8 @@ impl DatastoreInstance {
                     paired_at: device.paired_at,
                 }))
                 .collect::<Vec<_>>();
-            let operations = if baseline_complete {
+            let operations = {
+                self.check_sync_operation_history_bound(conn,key_epoch)?;
                 let mut statement = conn.prepare_cached(
                     "SELECT device_id,counter,key_epoch,operation_json,content_hash FROM sync_operations WHERE key_epoch = ?1 ORDER BY device_id,counter LIMIT 100001",
                 ).map_err(|_| DatastoreError::InternalError("Sync operations are unavailable".into()))?;
@@ -2898,8 +2996,8 @@ impl DatastoreInstance {
                             .map_err(|_| DatastoreError::InternalError("Sync operation is invalid".into()))?,
                     })
                 }).collect::<Result<Vec<_>, DatastoreError>>()?
-            } else { Vec::new() };
-            let stream_heads = if baseline_complete {
+            };
+            let stream_heads = {
                 let mut statement = conn.prepare_cached(
                     "SELECT device_id,revision,head_hash FROM sync_stream_heads WHERE vault_id = ?1 AND key_epoch = ?2 ORDER BY device_id LIMIT 100001",
                 ).map_err(|_| DatastoreError::InternalError("Sync stream heads are unavailable".into()))?;
@@ -2919,8 +3017,8 @@ impl DatastoreInstance {
                             .map_err(|_| DatastoreError::InternalError("Sync stream head is invalid".into()))?,
                     })
                 }).collect::<Result<Vec<_>, DatastoreError>>()?
-            } else { Vec::new() };
-            let tombstone_acknowledgements = if baseline_complete {
+            };
+            let tombstone_acknowledgements = {
                 let mut statement = conn.prepare_cached(
                     "SELECT origin_device_id,local_event_id,tombstone_counter,device_id,acknowledged_at FROM sync_tombstone_acknowledgements ORDER BY origin_device_id,local_event_id,tombstone_counter,device_id LIMIT 100001",
                 ).map_err(|_| DatastoreError::InternalError("Sync tombstone acknowledgements are unavailable".into()))?;
@@ -2944,7 +3042,7 @@ impl DatastoreInstance {
                         acknowledged_at,
                     })
                 }).collect::<Result<Vec<_>, DatastoreError>>()?
-            } else { Vec::new() };
+            };
             (trusted_devices, operations, stream_heads, tombstone_acknowledgements)
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
@@ -2972,6 +3070,10 @@ impl DatastoreInstance {
             stream_heads,
             counters,
             tombstone_acknowledgements,
+            backup_deletions: self.export_sync_backup_deletions(conn,&self.policy_context.iter().map(|b|format!("{b:02x}")).collect::<String>())?,
+            policy: if same_epoch {
+                Some(crate::sync_policy::export_recovery_policy(self, conn, true)?)
+            } else { None },
         })
     }
 
@@ -2981,6 +3083,9 @@ impl DatastoreInstance {
         let _material = self.get_sync_key_material(conn)?
             .ok_or_else(|| DatastoreError::InternalError("Sync keys are unavailable".into()))?;
         with_savepoint(conn, "sync_snapshot_mappings", || {
+            // Pre-baseline deletions have no operation journal, but recovery must retain their mapping as deleted.
+            conn.execute("UPDATE sync_event_mappings SET deleted=1 WHERE deleted=0 AND NOT EXISTS (SELECT 1 FROM events e JOIN buckets b ON b.id=e.bucketrow WHERE b.name=sync_event_mappings.local_bucket_id AND e.id=sync_event_mappings.local_event_id)", [])
+                .map_err(|_| DatastoreError::InternalError("Snapshot deleted mappings could not be reconciled".into()))?;
             let bucket_ids = self.buckets_cache.keys().cloned().collect::<Vec<_>>();
             for bucket_id in bucket_ids {
                 let events = self.get_events_unclipped(conn, &bucket_id, None, None, None)?;
@@ -3008,6 +3113,9 @@ impl DatastoreInstance {
         identity: &SyncDeviceIdentity,
     ) -> Result<(), DatastoreError> {
         with_savepoint(conn, "sync_recovery_install", || {
+            let context:String=self.policy_context.iter().map(|b|format!("{b:02x}")).collect();
+            self.merge_sync_backup_deletions(conn,&context,&state.backup_deletions,&Utc::now().to_rfc3339())?;
+            self.ensure_sync_backup_not_deleted(conn,&context,&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(material.vault_id()),material.key_epoch(),&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(snapshot.snapshot_id),&snapshot.envelopes.iter().map(|o|o.object_id.clone()).collect::<Vec<_>>())?;
             let existing = conn.query_row(
                 "SELECT 1 FROM sync_key_material WHERE id = 1",
                 [],
@@ -3026,8 +3134,6 @@ impl DatastoreInstance {
             }
             if state.schema_version != aw_models::SYNC_SCHEMA_VERSION_V1
                 || state.key_epoch != material.key_epoch()
-                || (state.baseline_complete == false
-                    && (!state.operations.is_empty() || !state.stream_heads.is_empty() || !state.tombstone_acknowledgements.is_empty()))
             {
                 return Err(DatastoreError::InternalError("Sync recovery state does not match its key epoch".into()));
             }
@@ -3162,6 +3268,11 @@ impl DatastoreInstance {
                         acknowledgement.tombstone_counter as i64, &acknowledgement.device_id[..], acknowledgement.acknowledged_at],
                 ).map_err(|_| DatastoreError::InternalError("Sync recovery tombstone acknowledgement could not be stored".into()))?;
             }
+            // A clean pre-sync vault may already have a pairing identity.
+            conn.execute("DELETE FROM key_value WHERE key = ?1", [crate::manual::MANUAL_SOURCE_CHECKPOINT_KEY])
+                .map_err(|_| DatastoreError::InternalError("The local manual source checkpoint could not be reset atomically".into()))?;
+            conn.execute("DELETE FROM sync_device_identity WHERE id = 1", [])
+                .map_err(|_| DatastoreError::InternalError("The pre-sync identity could not be replaced atomically".into()))?;
             self.create_sync_device_identity(conn, identity)?;
             if state.baseline_complete {
                 let acknowledged_at = Utc::now().to_rfc3339();
@@ -3190,6 +3301,7 @@ impl DatastoreInstance {
             }
             conn.execute("UPDATE sync_runtime_control SET enabled = 0 WHERE id = 1", [])
                 .map_err(|_| DatastoreError::InternalError("Could not disable sync during recovery".into()))?;
+            crate::sync_policy::stage_recovery(self,conn,state,material,snapshot)?;
             Ok(())
         })
     }
@@ -3215,6 +3327,82 @@ impl DatastoreInstance {
                 .map_err(|_| DatastoreError::InternalError("Could not disable sync during recovery".into()))?;
             Ok(())
         })
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn read_sync_backup_source(&self, conn: &Connection) -> Result<crate::SyncBackupSourceStateV1, DatastoreError> {
+        let current_snapshot_id = conn.query_row("SELECT snapshot_id FROM sync_snapshot_current WHERE id=1", [], |row| row.get::<_,Vec<u8>>(0))
+            .optional().map_err(|_| DatastoreError::InternalError("Backup pointer is unavailable".into()))?
+            .map(|id|id.try_into().map_err(|_|DatastoreError::InternalError("Backup pointer is invalid".into()))).transpose()?;
+        let mut query=conn.prepare_cached("SELECT vault_id,key_epoch,COUNT(*) FROM (SELECT object_id,vault_id,key_epoch FROM sync_objects UNION SELECT c.object_id,c.vault_id,c.key_epoch FROM sync_snapshot_chunks c JOIN sync_snapshot_current p ON p.snapshot_id=c.snapshot_id) GROUP BY vault_id,key_epoch ORDER BY vault_id,key_epoch LIMIT 100001")
+            .map_err(|_|DatastoreError::InternalError("Backup namespaces are unavailable".into()))?;
+        let rows=query.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?)))
+            .map_err(|_|DatastoreError::InternalError("Backup namespaces are unavailable".into()))?;
+        let mut namespaces=Vec::new();
+        for row in rows {
+            if namespaces.len()>=aw_sync_e2ee::MAX_BACKUP_SCAN_OBJECTS {return Err(DatastoreError::InternalError("Backup namespace limit exceeded".into()));}
+            let (vault_id,epoch,count)=row.map_err(|_|DatastoreError::InternalError("Backup namespace is invalid".into()))?;
+            validate_sync_id(&vault_id)?;
+            namespaces.push(crate::SyncBackupNamespaceV1 {vault_id,
+                key_epoch:u64::try_from(epoch).map_err(|_|DatastoreError::InternalError("Backup epoch is invalid".into()))?,
+                object_count:usize::try_from(count).map_err(|_|DatastoreError::InternalError("Backup count is invalid".into()))?});
+        }
+        Ok(crate::SyncBackupSourceStateV1 {context_id:self.policy_context.iter().map(|b|format!("{b:02x}")).collect(),
+            material:self.get_sync_key_material(conn)?, current_snapshot_id, namespaces})
+    }
+
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn stage_sync_backup_objects(&self,conn:&Connection,context:&str,objects:&[aw_models::SyncEnvelopeV1],at:&str)->Result<usize,DatastoreError> {
+        let error=||DatastoreError::InternalError("Backup stage is invalid, changed or exceeds its limits".into());
+        let actual:String=self.policy_context.iter().map(|b|format!("{b:02x}")).collect();
+        if context!=actual || objects.is_empty() || objects.len()>aw_sync_e2ee::MAX_BACKUP_SCAN_OBJECTS || DateTime::parse_from_rfc3339(at).is_err() {return Err(error());}
+        let first=&objects[0];let mut ids=BTreeSet::new();let mut bytes=0usize;
+        for object in objects {
+            object.validate().map_err(|_|error())?;
+            if object.vault_id!=first.vault_id || object.key_epoch!=first.key_epoch || object.key_epoch>i64::MAX as u64 || !ids.insert(&object.object_id) {return Err(error());}
+            bytes=bytes.checked_add(serde_json::to_vec(object).map_err(|_|error())?.len()).ok_or_else(error)?;
+            if bytes>aw_sync_e2ee::MAX_BACKUP_BUNDLE_BYTES {return Err(error());}
+        }
+        with_savepoint(conn,"peakactivity_backup_stage",|| {
+            let mut inserted=0usize;
+            for object in objects {
+                if self.get_sync_backup_object(conn,&object.object_id)?.is_some_and(|existing|existing!=*object) {return Err(error());}
+                inserted+=usize::from(self.put_sync_object(conn,object,at)?);
+            }
+            Ok(inserted)
+        })
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn get_sync_backup_object(&self,conn:&Connection,id:&str)->Result<Option<aw_models::SyncEnvelopeV1>,DatastoreError> {
+        validate_sync_id(id)?;
+        let retained=self.get_sync_object(conn,id)?;
+        let current=conn.query_row("SELECT c.vault_id,c.key_epoch,c.nonce,c.ciphertext FROM sync_snapshot_chunks c JOIN sync_snapshot_current p ON p.snapshot_id=c.snapshot_id WHERE c.object_id=?1",[id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)))
+            .optional().map_err(|_|DatastoreError::InternalError("Backup object is unavailable".into()))?
+            .map(|(vault_id,epoch,nonce,ciphertext)| {
+                let envelope=aw_models::SyncEnvelopeV1 {schema_version:1,object_id:id.into(),vault_id,
+                    key_epoch:u64::try_from(epoch).map_err(|_|DatastoreError::InternalError("Backup epoch is invalid".into()))?,nonce,ciphertext};
+                envelope.validate().map_err(|_|DatastoreError::InternalError("Backup envelope is invalid".into()))?;
+                Ok(envelope)
+            }).transpose()?;
+        match (retained,current) {
+            (Some(a),Some(b)) if a!=b=>Err(DatastoreError::InternalError("Backup immutable object conflict".into())),
+            (Some(a),_)|(_,Some(a))=>Ok(Some(a)),
+            _=>Ok(None),
+        }
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn list_sync_backup_objects(&self,conn:&Connection,vault:&str,after:Option<&str>,limit:usize)->Result<crate::SyncObjectPageV1,DatastoreError> {
+        validate_sync_id(vault)?;if let Some(id)=after {validate_sync_id(id)?;}
+        let limit=limit.clamp(1,64);
+        let mut query=conn.prepare_cached("SELECT object_id FROM (SELECT object_id,vault_id FROM sync_objects UNION SELECT c.object_id,c.vault_id FROM sync_snapshot_chunks c JOIN sync_snapshot_current p ON p.snapshot_id=c.snapshot_id) WHERE vault_id=?1 AND (?2 IS NULL OR object_id>?2) ORDER BY object_id LIMIT ?3")
+            .map_err(|_|DatastoreError::InternalError("Backup list is unavailable".into()))?;
+        let rows=query.query_map(params![vault,after,(limit+1) as i64],|row|row.get::<_,String>(0)).map_err(|_|DatastoreError::InternalError("Backup list is unavailable".into()))?;
+        let mut ids=rows.collect::<Result<Vec<_>,_>>().map_err(|_|DatastoreError::InternalError("Backup list is invalid".into()))?;
+        let next_cursor=if ids.len()>limit {ids.truncate(limit);ids.last().cloned()} else {None};
+        let objects=ids.into_iter().map(|id|self.get_sync_backup_object(conn,&id)?.ok_or_else(||DatastoreError::InternalError("Backup object disappeared".into()))).collect::<Result<Vec<_>,_>>()?;
+        Ok(crate::SyncObjectPageV1 {objects,next_cursor})
     }
 
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
@@ -3252,6 +3440,7 @@ impl DatastoreInstance {
         stored_at: &str,
     ) -> Result<bool, DatastoreError> {
         envelope.validate().map_err(|_| DatastoreError::InternalError("Invalid encrypted sync object".into()))?;
+        self.reject_deleted_backup_object(conn,&envelope.object_id)?;
         DateTime::parse_from_rfc3339(stored_at)
             .map_err(|_| DatastoreError::InternalError("Invalid sync object time".into()))?;
         if let Some(existing) = self.get_sync_object(conn, &envelope.object_id)? {
@@ -3422,11 +3611,13 @@ impl DatastoreInstance {
         material: &crate::SyncKeyMaterial,
     ) -> Result<(), DatastoreError> {
         let vault_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(material.vault_id());
+        self.reject_deleted_backup_version(conn,&vault_id,material.key_epoch(),&snapshot.snapshot_id)?;
         let mut object_ids = BTreeSet::new();
         if snapshot.envelopes.is_empty() || snapshot.envelopes.len() > i64::MAX as usize {
             return Err(DatastoreError::InternalError("Sync snapshot is empty or too large".into()));
         }
         for envelope in &snapshot.envelopes {
+            self.reject_deleted_backup_object(conn,&envelope.object_id)?;
             envelope.validate().map_err(|_| DatastoreError::InternalError("Invalid encrypted sync snapshot".into()))?;
             if envelope.vault_id != vault_id
                 || envelope.key_epoch != material.key_epoch()
@@ -3945,16 +4136,24 @@ impl DatastoreInstance {
     }
 
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-    fn all_sync_operations_for_epoch(
+    pub(crate) fn check_sync_operation_history_bound(&self,conn:&Connection,epoch:u64)->Result<(),DatastoreError> {
+        let epoch=i64::try_from(epoch).ok().filter(|n|*n>0).ok_or_else(||DatastoreError::InternalError("Sync operation epoch is invalid".into()))?;
+        let (count,bytes,max):(i64,i64,i64)=conn.query_row("SELECT COUNT(*),COALESCE(SUM(length(CAST(operation_json AS BLOB))),0),COALESCE(MAX(length(CAST(operation_json AS BLOB))),0) FROM sync_operations WHERE key_epoch=?1",[epoch],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|_|DatastoreError::InternalError("Sync operation history bound could not be verified".into()))?;
+        if count>100000||bytes<0||bytes as u64>aw_sync_e2ee::MAX_BACKUP_BUNDLE_BYTES as u64||max<0||max as usize>SYNC_MAX_CHUNK_BYTES {return Err(DatastoreError::InternalError("Sync operation history exceeds its supported bound".into()));}Ok(())
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub(crate) fn all_sync_operations_for_epoch(
         &self,
         conn: &Connection,
         key_epoch: u64,
     ) -> Result<Vec<SyncOperationV1>, DatastoreError> {
+        self.check_sync_operation_history_bound(conn,key_epoch)?;
         let epoch = i64::try_from(key_epoch)
             .ok().filter(|epoch| *epoch > 0)
             .ok_or_else(|| DatastoreError::InternalError("Invalid sync operation epoch".into()))?;
         let mut statement = conn.prepare_cached(
-            "SELECT device_id,counter,operation_json,content_hash FROM sync_operations WHERE key_epoch = ?1 ORDER BY device_id,counter",
+            "SELECT device_id,counter,operation_json,content_hash FROM sync_operations WHERE key_epoch = ?1 ORDER BY device_id,counter LIMIT 100001",
         ).map_err(|_| DatastoreError::InternalError("Sync operation log is unavailable".into()))?;
         let rows = statement.query_map([epoch], |row| {
             Ok((
@@ -3966,6 +4165,7 @@ impl DatastoreInstance {
         }).map_err(|_| DatastoreError::InternalError("Sync operation log is unavailable".into()))?;
         let records = rows.collect::<Result<Vec<_>, _>>()
             .map_err(|_| DatastoreError::InternalError("Stored sync operation is invalid".into()))?;
+        if records.len() > 100_000 { return Err(DatastoreError::InternalError("Sync operation history exceeds the supported recovery bound".into())); }
         records.into_iter().map(|(device, counter, json, stored_hash)| {
             let hash = digest(&SHA256, json.as_bytes());
             let device: [u8; 16] = device.try_into()
@@ -3978,6 +4178,7 @@ impl DatastoreInstance {
             let operation: SyncOperationV1 = serde_json::from_str(&json)
                 .map_err(|_| DatastoreError::InternalError("Stored sync operation is invalid".into()))?;
             operation.validate().map_err(|_| DatastoreError::InternalError("Stored sync operation is invalid".into()))?;
+            crate::sync_policy::validate_operation(&operation)?;
             let operation_device = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&operation.device_id)
                 .map_err(|_| DatastoreError::InternalError("Stored sync operation is invalid".into()))?;
             if operation_device.as_slice() != &device[..] || operation.counter != counter {
@@ -4491,7 +4692,7 @@ mod egress_migration_tests {
             [],
             |row| row.get(0),
         ).unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 16);
         assert_eq!(setting, "value");
         assert_eq!(table_count, 1);
         let approvals: i64 = conn.query_row(
@@ -4547,7 +4748,7 @@ mod sync_v12_migration_tests {
 
         DatastoreInstance::new(&conn, true, false).unwrap();
 
-        assert_eq!(_get_db_version(&conn), 14);
+        assert_eq!(_get_db_version(&conn), 16);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM buckets", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
         let signing_seed: Option<Vec<u8>> = conn.query_row(

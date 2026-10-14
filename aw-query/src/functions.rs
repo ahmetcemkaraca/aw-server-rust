@@ -107,7 +107,10 @@ pub fn fill_env(env: &mut VarEnv) {
     );
     env.insert(
         "categorize_explained".to_string(),
-        DataType::Function("categorize_explained".into(), qfunctions::categorize_explained),
+        DataType::Function(
+            "categorize_explained".into(),
+            qfunctions::categorize_explained,
+        ),
     );
     env.insert(
         "tag".to_string(),
@@ -155,7 +158,11 @@ mod qfunctions {
         let bucket_id: String = args.next().unwrap().try_into()?;
         let limit: Option<usize> = args.next().map(TryInto::try_into).transpose()?;
         let limit = limit
-            .map(|value| u64::try_from(value).map_err(|_| QueryError::InvalidFunctionParameters("query_bucket limit is too large".into())))
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    QueryError::InvalidFunctionParameters("query_bucket limit is too large".into())
+                })
+            })
             .transpose()?;
         let interval = validate::get_timeinterval(env)?;
 
@@ -672,6 +679,260 @@ mod validate {
             Err(_e) => Err(QueryError::TimeIntervalError(format!(
                 "Failed to parse TIMEINTERVAL: {interval_str}"
             ))),
+        }
+    }
+}
+
+const CONTROLLED_NAMES: &[&str] = &[
+    "query_bucket",
+    "query_bucket_names",
+    "sort_by_timestamp",
+    "sort_by_duration",
+    "sum_durations",
+    "event_count",
+    "limit_events",
+    "flood",
+    "filter_keyvals",
+    "exclude_keyvals",
+    "filter_period_intersect",
+    "union_no_overlap",
+    "categorize",
+    "categorize_explained",
+    "merge_events_by_keys",
+    "concat",
+    "contains",
+];
+fn controlled_marker(_: Vec<DataType>, _: &VarEnv, _: &Datastore) -> Result<DataType, QueryError> {
+    unreachable!("controlled markers are never called")
+}
+pub(crate) fn fill_controlled_env(
+    env: &mut VarEnv,
+    control: &aw_models::QueryControl,
+) -> Result<(), aw_models::ReportExecutionErrorV1> {
+    for name in CONTROLLED_NAMES {
+        control.charge_values(1)?;
+        control
+            .charge_bytes((2 * name.len() + std::mem::size_of::<(String, DataType)>()) as u64)?;
+        env.insert(
+            (*name).into(),
+            DataType::Function((*name).into(), controlled_marker),
+        );
+    }
+    Ok(())
+}
+
+fn controlled_arity(
+    actual: usize,
+    expected: usize,
+) -> Result<(), aw_models::ReportExecutionErrorV1> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(aw_models::ReportExecutionErrorV1::InternalError)
+    }
+}
+fn controlled_wrap_events(
+    events: Vec<aw_models::Event>,
+    control: &aw_models::QueryControl,
+) -> Result<DataType, aw_models::ReportExecutionErrorV1> {
+    control.charge_values(events.len() as u64)?;
+    control.charge_bytes((events.len() * std::mem::size_of::<DataType>()) as u64)?;
+    Ok(DataType::List(
+        events.into_iter().map(DataType::Event).collect(),
+    ))
+}
+pub(crate) fn dispatch_controlled(
+    name: &str,
+    args: Vec<DataType>,
+    env: &VarEnv,
+    ti: &aw_models::TimeInterval,
+    source: &crate::FrozenQuerySource,
+    control: &aw_models::QueryControl,
+) -> Result<DataType, aw_models::ReportExecutionErrorV1> {
+    use aw_models::ReportExecutionErrorV1 as Error;
+    control.charge_fuel(1)?;
+    let count = args.len();
+    let mut args = args.into_iter();
+    macro_rules! take {
+        () => {
+            args.next().ok_or(Error::InternalError)?
+        };
+    }
+    match name {
+        "query_bucket" => {
+            if count != 1 && count != 2 {
+                return Err(Error::InternalError);
+            }
+            let id = take!().controlled_string()?;
+            let limit = args.next().map(DataType::controlled_index).transpose()?;
+            let actual = match env.get("TIMEINTERVAL") {
+                Some(DataType::String(raw)) => {
+                    if raw.len() > 128 {
+                        return Err(Error::InternalError);
+                    }
+                    let (a, b) = raw.split_once('/').ok_or(Error::InternalError)?;
+                    let a = chrono::DateTime::parse_from_rfc3339(a)
+                        .map_err(|_| Error::InternalError)?
+                        .with_timezone(&chrono::Utc);
+                    let b = chrono::DateTime::parse_from_rfc3339(b)
+                        .map_err(|_| Error::InternalError)?
+                        .with_timezone(&chrono::Utc);
+                    aw_models::TimeInterval::new(a, b)
+                }
+                _ => return Err(Error::InternalError),
+            };
+            controlled_wrap_events(source.events(&id, &actual, limit, control)?, control)
+        }
+        "query_bucket_names" => {
+            controlled_arity(count, 0)?;
+            let names = source.bucket_names(control)?;
+            control.charge_values(names.len() as u64)?;
+            control.charge_bytes((names.len() * std::mem::size_of::<DataType>()) as u64)?;
+            Ok(DataType::List(
+                names.into_iter().map(DataType::String).collect(),
+            ))
+        }
+        "sort_by_timestamp" | "sort_by_duration" | "flood" => {
+            controlled_arity(count, 1)?;
+            let events = take!().controlled_events(control)?;
+            let output = match name {
+                "sort_by_timestamp" => aw_transform::sort_by_timestamp_controlled(events, control)?,
+                "sort_by_duration" => aw_transform::sort_by_duration_controlled(events, control)?,
+                _ => aw_transform::flood_controlled(events, chrono::Duration::seconds(5), control)?,
+            };
+            controlled_wrap_events(output, control)
+        }
+        "event_count" | "sum_durations" => {
+            controlled_arity(count, 1)?;
+            let events = take!().controlled_events(control)?;
+            if name == "event_count" {
+                return Ok(DataType::Number(events.len() as f64));
+            }
+            let mut total = chrono::Duration::zero();
+            for event in events {
+                control.charge_fuel(1)?;
+                total = total
+                    .checked_add(&event.duration)
+                    .ok_or(Error::DataIntegrity)?;
+            }
+            Ok(DataType::Number(total.num_milliseconds() as f64 / 1000.0))
+        }
+        "filter_keyvals" | "exclude_keyvals" => {
+            controlled_arity(count, 3)?;
+            let events = take!().controlled_events(control)?;
+            let key = take!().controlled_string()?;
+            let values = take!().controlled_list()?;
+            control
+                .charge_bytes((values.len() * std::mem::size_of::<serde_json::Value>()) as u64)?;
+            let mut decoded = Vec::new();
+            for value in values {
+                decoded.push(value.controlled_value(control)?);
+            }
+            let events = if name == "filter_keyvals" {
+                aw_transform::filter_keyvals_controlled(events, &key, &decoded, control)?
+            } else {
+                aw_transform::exclude_keyvals_controlled(events, &key, &decoded, control)?
+            };
+            controlled_wrap_events(events, control)
+        }
+        "filter_period_intersect" | "union_no_overlap" => {
+            controlled_arity(count, 2)?;
+            let a = take!().controlled_events(control)?;
+            let b = take!().controlled_events(control)?;
+            let events = if name == "union_no_overlap" {
+                aw_transform::union_no_overlap_controlled(a, b, control)?
+            } else {
+                aw_transform::filter_period_intersect_controlled(a, b, control)?
+            };
+            controlled_wrap_events(events, control)
+        }
+        "merge_events_by_keys" => {
+            controlled_arity(count, 2)?;
+            let events = take!().controlled_events(control)?;
+            let keys = take!().controlled_strings(control)?;
+            controlled_wrap_events(
+                aw_transform::merge_events_by_keys_controlled(events, keys, control)?,
+                control,
+            )
+        }
+        "categorize" | "categorize_explained" => {
+            controlled_arity(count, 2)?;
+            let events = take!().controlled_events(control)?;
+            let rules = take!().controlled_category_rules(control)?;
+            let mut cache = source.regex_cache.borrow_mut();
+            if name == "categorize" {
+                return controlled_wrap_events(
+                    aw_transform::classify::categorize_controlled(
+                        events, &rules, &mut cache, control,
+                    )?,
+                    control,
+                );
+            }
+            let traced = aw_transform::classify::categorize_with_trace_controlled(
+                events, &rules, &mut cache, control,
+            )?;
+            let mut output = Vec::new();
+            for (mut event, trace) in traced {
+                control.charge_fuel(1)?;
+                control.charge_values(1)?;
+                control.charge_bytes(
+                    ("$category_trace".len() + std::mem::size_of::<(String, serde_json::Value)>())
+                        as u64,
+                )?;
+                let value =
+                    aw_transform::classify::category_trace_value_controlled(&trace, control)?;
+                event.data.insert("$category_trace".into(), value);
+                control.charge_bytes(std::mem::size_of::<aw_models::Event>() as u64)?;
+                output.push(event);
+            }
+            controlled_wrap_events(output, control)
+        }
+        "limit_events" => {
+            controlled_arity(count, 2)?;
+            let events = take!().controlled_events(control)?;
+            let limit = take!().controlled_index()?;
+            control.charge_values(limit.min(events.len()) as u64)?;
+            control.charge_bytes(
+                (limit.min(events.len()) * std::mem::size_of::<aw_models::Event>()) as u64,
+            )?;
+            controlled_wrap_events(events.into_iter().take(limit).collect(), control)
+        }
+        "contains" => {
+            controlled_arity(count, 2)?;
+            let container = take!();
+            let needle = take!();
+            let found = match container {
+                DataType::List(items) => {
+                    let mut found = false;
+                    needle.validate_controlled(control)?;
+                    for item in items {
+                        control.charge_fuel(1)?;
+                        item.validate_controlled(control)?;
+                        if item == needle {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                }
+                DataType::Dict(items) => items.contains_key(&needle.controlled_string()?),
+                _ => return Err(Error::InternalError),
+            };
+            control.checkpoint()?;
+            Ok(DataType::Bool(found))
+        }
+        "concat" => {
+            controlled_arity(count, 2)?;
+            let mut a = take!().controlled_list()?;
+            let mut b = take!().controlled_list()?;
+            control.charge_values(b.len() as u64)?;
+            control.charge_bytes(((a.len() + b.len()) * std::mem::size_of::<DataType>()) as u64)?;
+            a.append(&mut b);
+            Ok(DataType::List(a))
+        }
+        _ => {
+            let _ = ti;
+            Err(Error::InternalError)
         }
     }
 }

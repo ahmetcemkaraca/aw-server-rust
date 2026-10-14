@@ -142,3 +142,201 @@ impl<'a> Iterator for Lexer<'a> {
         }
     }
 }
+
+pub(crate) struct ControlledLexer<'a> {
+    text: &'a str,
+    offset: usize,
+    line: usize,
+    control: &'a aw_models::QueryControl,
+    error: Option<aw_models::ReportExecutionErrorV1>,
+}
+impl<'a> ControlledLexer<'a> {
+    pub(crate) fn new(
+        text: &'a str,
+        control: &'a aw_models::QueryControl,
+    ) -> Result<Self, aw_models::ReportExecutionErrorV1> {
+        if text.len() > aw_models::QueryLimits::MANAGED.max_query_bytes {
+            return Err(aw_models::ReportExecutionErrorV1::ByteLimit);
+        }
+        control.charge_bytes(text.len() as u64)?;
+        Ok(Self {
+            text,
+            offset: 0,
+            line: 1,
+            control,
+            error: None,
+        })
+    }
+    pub(crate) fn error(&self) -> Option<aw_models::ReportExecutionErrorV1> {
+        self.error
+    }
+    fn token(&mut self) -> Result<Option<(Token, Span)>, aw_models::ReportExecutionErrorV1> {
+        use aw_models::ReportExecutionErrorV1 as Error;
+        loop {
+            self.control.checkpoint()?;
+            if let Some(error) = crate::parser::construction_error() {
+                return Err(error);
+            }
+            let Some(byte) = self.text.as_bytes().get(self.offset).copied() else {
+                return Ok(None);
+            };
+            self.control.charge_fuel(1)?;
+            if byte.is_ascii_whitespace() {
+                if byte == b'\n' {
+                    self.line += 1;
+                }
+                self.offset += 1;
+                continue;
+            }
+            if byte == b'#' {
+                while self
+                    .text
+                    .as_bytes()
+                    .get(self.offset)
+                    .is_some_and(|b| *b != b'\n')
+                {
+                    self.control.charge_fuel(1)?;
+                    self.offset += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        self.control.charge_values(1)?;
+        self.control.charge_bytes(
+            (std::mem::size_of::<Token>()
+                + std::mem::size_of::<Span>()
+                + 3 * std::mem::size_of::<usize>()) as u64,
+        )?;
+        let start = self.offset;
+        let first = self.text.as_bytes()[start];
+        let token = if first == b'"' {
+            let mut end = start + 1;
+            let mut escaped = false;
+            let mut closed = false;
+            while let Some(byte) = self.text.as_bytes().get(end).copied() {
+                self.control.charge_fuel(1)?;
+                if !escaped && byte == b'"' {
+                    end += 1;
+                    closed = true;
+                    break;
+                }
+                if !escaped && byte == b'\\' {
+                    escaped = true;
+                } else {
+                    escaped = false;
+                }
+                end += 1;
+            }
+            if !closed {
+                return Err(Error::InternalError);
+            }
+            self.control.charge_bytes((end - start) as u64)?;
+            let value =
+                serde_json::from_str(&self.text[start..end]).map_err(|_| Error::InternalError)?;
+            self.offset = end;
+            Token::String(value)
+        } else if first.is_ascii_alphabetic() || first == b'_' {
+            self.offset += 1;
+            while self
+                .text
+                .as_bytes()
+                .get(self.offset)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                self.control.charge_fuel(1)?;
+                self.offset += 1;
+            }
+            let word = &self.text[start..self.offset];
+            match word {
+                "if" => Token::If,
+                "elif" => Token::ElseIf,
+                "else" => Token::Else,
+                "return" => Token::Return,
+                "true" | "True" => Token::Bool(true),
+                "false" | "False" => Token::Bool(false),
+                _ => {
+                    self.control.charge_bytes(word.len() as u64)?;
+                    Token::Ident(word.to_owned())
+                }
+            }
+        } else if first.is_ascii_digit() {
+            self.offset += 1;
+            while self
+                .text
+                .as_bytes()
+                .get(self.offset)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                self.control.charge_fuel(1)?;
+                self.offset += 1;
+            }
+            if self.text.as_bytes().get(self.offset) == Some(&b'.') {
+                self.offset += 1;
+                while self
+                    .text
+                    .as_bytes()
+                    .get(self.offset)
+                    .is_some_and(u8::is_ascii_digit)
+                {
+                    self.control.charge_fuel(1)?;
+                    self.offset += 1;
+                }
+            }
+            let number: f64 = self.text[start..self.offset]
+                .parse()
+                .map_err(|_| Error::InternalError)?;
+            if !number.is_finite() {
+                return Err(Error::InternalError);
+            }
+            Token::Number(number)
+        } else {
+            self.offset += 1;
+            match first {
+                b'=' if self.text.as_bytes().get(self.offset) == Some(&b'=') => {
+                    self.offset += 1;
+                    Token::Equals
+                }
+                b'=' => Token::Assign,
+                b'+' => Token::Plus,
+                b'-' => Token::Minus,
+                b'*' => Token::Star,
+                b'/' => Token::Slash,
+                b'%' => Token::Percent,
+                b'(' => Token::LParen,
+                b')' => Token::RParen,
+                b'[' => Token::LBracket,
+                b']' => Token::RBracket,
+                b'{' => Token::LBrace,
+                b'}' => Token::RBrace,
+                b',' => Token::Comma,
+                b':' => Token::Colon,
+                b';' => Token::Semi,
+                _ => return Err(Error::InternalError),
+            }
+        };
+        Ok(Some((
+            token,
+            Span {
+                lo: start,
+                hi: self.offset,
+                line: self.line,
+            },
+        )))
+    }
+}
+impl Iterator for ControlledLexer<'_> {
+    type Item = (Token, Span);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.error.is_some() {
+            return None;
+        }
+        match self.token() {
+            Ok(token) => token,
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
+        }
+    }
+}

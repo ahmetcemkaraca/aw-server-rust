@@ -440,3 +440,255 @@ impl TryFrom<&DataType> for Rule {
         }
     }
 }
+
+impl DataType {
+    pub(crate) fn charge_copy(
+        &self,
+        control: &aw_models::QueryControl,
+    ) -> Result<(), aw_models::ReportExecutionErrorV1> {
+        self.charge_copy_inner(control, 1)
+    }
+    fn charge_copy_inner(
+        &self,
+        control: &aw_models::QueryControl,
+        depth: usize,
+    ) -> Result<(), aw_models::ReportExecutionErrorV1> {
+        use aw_models::{QueryLimits, ReportExecutionErrorV1 as Error};
+        if depth > QueryLimits::MANAGED.max_ast_depth {
+            return Err(Error::ValueLimit);
+        }
+        control.charge_fuel(1)?;
+        control.charge_values(1)?;
+        let root = std::mem::size_of::<Self>()
+            - if matches!(self, Self::Event(_)) {
+                std::mem::size_of::<aw_models::Event>()
+            } else {
+                0
+            };
+        control.charge_bytes(root as u64)?;
+        match self {
+            Self::String(s) | Self::Function(s, _) => control.charge_bytes(s.len() as u64)?,
+            Self::Event(e) => control.charge_event_copy(e)?,
+            Self::List(items) => {
+                for item in items {
+                    item.charge_copy_inner(control, depth + 1)?;
+                }
+            }
+            Self::Dict(items) => {
+                for (key, item) in items {
+                    control.charge_values(1)?;
+                    control.charge_bytes((key.len() + std::mem::size_of::<String>()) as u64)?;
+                    item.charge_copy_inner(control, depth + 1)?;
+                }
+            }
+            Self::Number(n) if !n.is_finite() => return Err(Error::InternalError),
+            _ => {}
+        }
+        Ok(())
+    }
+    pub(crate) fn validate_controlled(
+        &self,
+        control: &aw_models::QueryControl,
+    ) -> Result<(), aw_models::ReportExecutionErrorV1> {
+        fn validate(
+            value: &DataType,
+            control: &aw_models::QueryControl,
+            depth: usize,
+        ) -> Result<(), aw_models::ReportExecutionErrorV1> {
+            use aw_models::{QueryLimits, ReportExecutionErrorV1 as Error};
+            if depth > QueryLimits::MANAGED.max_ast_depth {
+                return Err(Error::ValueLimit);
+            }
+            control.charge_fuel(1)?;
+            match value {
+                DataType::Function(_, _) => Err(Error::InternalError),
+                DataType::Number(n) if !n.is_finite() => Err(Error::InternalError),
+                DataType::List(items) => {
+                    for item in items {
+                        validate(item, control, depth + 1)?;
+                    }
+                    Ok(())
+                }
+                DataType::Dict(items) => {
+                    for item in items.values() {
+                        validate(item, control, depth + 1)?;
+                    }
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+        validate(self, control, 1)
+    }
+    pub(crate) fn controlled_list(
+        self,
+    ) -> Result<Vec<DataType>, aw_models::ReportExecutionErrorV1> {
+        match self {
+            Self::List(list) => Ok(list),
+            _ => Err(aw_models::ReportExecutionErrorV1::InternalError),
+        }
+    }
+    pub(crate) fn controlled_string(self) -> Result<String, aw_models::ReportExecutionErrorV1> {
+        match self {
+            Self::String(text) => Ok(text),
+            _ => Err(aw_models::ReportExecutionErrorV1::InternalError),
+        }
+    }
+}
+
+impl DataType {
+    pub(crate) fn controlled_events(
+        self,
+        control: &aw_models::QueryControl,
+    ) -> Result<Vec<Event>, aw_models::ReportExecutionErrorV1> {
+        let items = self.controlled_list()?;
+        control.charge_values(items.len() as u64)?;
+        control.charge_bytes((items.len() * std::mem::size_of::<Event>()) as u64)?;
+        let mut events = Vec::with_capacity(items.len());
+        for item in items {
+            control.charge_fuel(1)?;
+            let Self::Event(event) = item else {
+                return Err(aw_models::ReportExecutionErrorV1::InternalError);
+            };
+            events.push(event);
+        }
+        Ok(events)
+    }
+    pub(crate) fn controlled_strings(
+        self,
+        control: &aw_models::QueryControl,
+    ) -> Result<Vec<String>, aw_models::ReportExecutionErrorV1> {
+        let items = self.controlled_list()?;
+        control.charge_values(items.len() as u64)?;
+        control.charge_bytes((items.len() * std::mem::size_of::<String>()) as u64)?;
+        let mut strings = Vec::with_capacity(items.len());
+        for item in items {
+            control.charge_fuel(1)?;
+            strings.push(item.controlled_string()?);
+        }
+        Ok(strings)
+    }
+    pub(crate) fn controlled_index(self) -> Result<usize, aw_models::ReportExecutionErrorV1> {
+        match self {
+            Self::Number(n)
+                if n.is_finite() && n >= 0.0 && n.fract() == 0.0 && n < (usize::MAX as f64) =>
+            {
+                Ok(n as usize)
+            }
+            _ => Err(aw_models::ReportExecutionErrorV1::InternalError),
+        }
+    }
+    pub(crate) fn controlled_value(
+        self,
+        control: &aw_models::QueryControl,
+    ) -> Result<Value, aw_models::ReportExecutionErrorV1> {
+        fn convert(
+            value: DataType,
+            control: &aw_models::QueryControl,
+            depth: usize,
+        ) -> Result<Value, aw_models::ReportExecutionErrorV1> {
+            use aw_models::{QueryLimits, ReportExecutionErrorV1 as Error};
+            if depth > QueryLimits::MANAGED.max_ast_depth {
+                return Err(Error::ValueLimit);
+            }
+            control.charge_fuel(1)?;
+            control.charge_values(1)?;
+            control.charge_bytes(std::mem::size_of::<Value>() as u64)?;
+            match value {
+                DataType::None() => Ok(Value::Null),
+                DataType::Bool(n) => Ok(n.into()),
+                DataType::Number(n) => serde_json::Number::from_f64(n)
+                    .map(Value::Number)
+                    .ok_or(Error::InternalError),
+                DataType::String(s) => Ok(s.into()),
+                DataType::List(items) => {
+                    let mut values = Vec::new();
+                    for item in items {
+                        values.push(convert(item, control, depth + 1)?);
+                    }
+                    Ok(Value::Array(values))
+                }
+                DataType::Dict(items) => {
+                    let mut values = serde_json::Map::new();
+                    for (key, item) in items {
+                        control.charge_values(1)?;
+                        control.charge_bytes(std::mem::size_of::<String>() as u64)?;
+                        values.insert(key, convert(item, control, depth + 1)?);
+                    }
+                    Ok(Value::Object(values))
+                }
+                _ => Err(Error::InternalError),
+            }
+        }
+        convert(self, control, 1)
+    }
+    pub(crate) fn controlled_rule(
+        self,
+        control: &aw_models::QueryControl,
+    ) -> Result<aw_transform::classify::ControlledRuleV1, aw_models::ReportExecutionErrorV1> {
+        use aw_models::ReportExecutionErrorV1 as Error;
+        use aw_transform::classify::ControlledRuleV1;
+        let Self::Dict(mut fields) = self else {
+            return Err(Error::InternalError);
+        };
+        let kind = match fields.remove("type") {
+            None | Some(Self::None()) => false,
+            Some(Self::String(kind)) if kind == "none" => false,
+            Some(Self::String(kind)) if kind == "regex" => true,
+            _ => return Err(Error::InternalError),
+        };
+        let regex = fields.remove("regex");
+        let ignore = fields.remove("ignore_case");
+        let keys = fields.remove("select_keys");
+        if !fields.is_empty() {
+            return Err(Error::InternalError);
+        }
+        if !kind {
+            return Ok(ControlledRuleV1::None);
+        }
+        let pattern = regex.ok_or(Error::InternalError)?.controlled_string()?;
+        let ignore = match ignore {
+            None | Some(Self::None()) => false,
+            Some(Self::Bool(flag)) => flag,
+            _ => return Err(Error::InternalError),
+        };
+        let keys = keys
+            .map(|keys| keys.controlled_strings(control))
+            .transpose()?;
+        ControlledRuleV1::regex(pattern, ignore, keys, control)
+    }
+    pub(crate) fn controlled_category_rules(
+        self,
+        control: &aw_models::QueryControl,
+    ) -> Result<
+        Vec<(Vec<String>, aw_transform::classify::ControlledRuleV1)>,
+        aw_models::ReportExecutionErrorV1,
+    > {
+        let items = self.controlled_list()?;
+        control.charge_values(items.len() as u64)?;
+        control.charge_bytes(
+            (items.len()
+                * std::mem::size_of::<(Vec<String>, aw_transform::classify::ControlledRuleV1)>())
+                as u64,
+        )?;
+        let mut rules = Vec::new();
+        for item in items {
+            control.charge_fuel(1)?;
+            let items = item.controlled_list()?;
+            if items.len() != 2 {
+                return Err(aw_models::ReportExecutionErrorV1::InternalError);
+            }
+            let mut items = items.into_iter();
+            let path = items
+                .next()
+                .ok_or(aw_models::ReportExecutionErrorV1::InternalError)?
+                .controlled_strings(control)?;
+            let rule = items
+                .next()
+                .ok_or(aw_models::ReportExecutionErrorV1::InternalError)?
+                .controlled_rule(control)?;
+            rules.push((path, rule));
+        }
+        Ok(rules)
+    }
+}

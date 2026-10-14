@@ -18,9 +18,25 @@ macro_rules! json_map {
 }
 
 mod datastore;
+#[cfg(any(feature="encryption",feature="encryption-vendored"))]
+mod backup_lifecycle;
+#[cfg(any(feature="encryption",feature="encryption-vendored"))]
+pub use backup_lifecycle::{SyncBackupDeletionCursorV1,SyncBackupDeletionPageV1,SyncBackupContinuityV1};
 mod legacy_import;
 mod privacy_filter;
+mod reports;
+pub use reports::{report_calculation_sha256, PreparedReportImportV1};
 mod worker;
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+mod sync_recovery;
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+pub use sync_recovery::validate_sync_recovery_state_v1;
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+pub mod sync_policy;
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+pub use sync_policy::{is_sync_policy_field_v1, validate_sync_policy_field_v1, validate_sync_recovery_policy_v1, SyncPolicyActivationGateV1, SyncPolicyActivationContextV1};
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+mod manual;
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
 pub mod plugins;
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
@@ -28,6 +44,8 @@ pub mod vault;
 
 pub use self::datastore::{DatastoreInstance, EventCorrection};
 pub use self::worker::{Datastore, EgressLease, ImportSummary};
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+pub use self::manual::{ManualActivityEntryV1, ManualProjectionResultV1, MANUAL_COMPANION_BUCKET, MANUAL_COMPANION_CLIENT, MANUAL_COMPANION_HOSTNAME};
 
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
 #[derive(Clone)]
@@ -86,6 +104,27 @@ pub struct SyncKeyMaterial {
 pub struct SyncSnapshotV1 {
     pub snapshot_id: [u8; 16],
     pub envelopes: Vec<aw_models::SyncEnvelopeV1>,
+}
+
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+#[derive(Debug, PartialEq)]
+pub struct SyncBackupNamespaceV1 {
+    pub vault_id: String,
+    pub key_epoch: u64,
+    pub object_count: usize,
+}
+
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+pub struct SyncBackupSourceStateV1 {
+    pub context_id: String,
+    pub material: Option<SyncKeyMaterial>,
+    pub current_snapshot_id: Option<[u8; 16]>,
+    pub namespaces: Vec<SyncBackupNamespaceV1>,
+}
+
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+impl fmt::Debug for SyncBackupSourceStateV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("SyncBackupSourceStateV1(<redacted>)") }
 }
 
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
@@ -246,7 +285,7 @@ pub struct SyncRecoveryTombstoneAckV1 {
     pub acknowledged_at: String,
 }
 
-/// Public sync continuity data stored inside the encrypted recovery snapshot.
+/// Sync continuity data stored inside the encrypted recovery snapshot.
 /// Device private keys deliberately have no field in this type.
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
@@ -262,6 +301,10 @@ pub struct SyncRecoveryStateV1 {
     pub stream_heads: Vec<SyncRecoveryStreamHeadV1>,
     pub counters: Vec<SyncRecoveryCounterV1>,
     pub tombstone_acknowledgements: Vec<SyncRecoveryTombstoneAckV1>,
+    #[serde(default, skip_serializing_if="Vec::is_empty")]
+    pub backup_deletions: Vec<aw_models::SnapshotDeletionFactV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<aw_models::SyncRecoveryPolicyV1>,
 }
 
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]

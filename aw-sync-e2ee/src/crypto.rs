@@ -92,6 +92,12 @@ pub struct VaultDataKeyV1 {
 }
 
 impl VaultDataKeyV1 {
+    pub(crate) fn backup_deletion_binding(&self) -> [u8; 32] {
+        let mut hash=ring::digest::Context::new(&ring::digest::SHA256);
+        hash.update(b"PeakActivity-Backup-Deletion-Key-v1\0");
+        hash.update(self.secret.as_ref());hash.update(&self.vault_id);hash.update(&self.key_epoch.to_be_bytes());
+        hash.finish().as_ref().try_into().unwrap()
+    }
     pub fn key_epoch(&self) -> u64 {
         self.key_epoch
     }

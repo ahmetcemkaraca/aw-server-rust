@@ -1,0 +1,42 @@
+{
+  "method_id": "work-time-category-summary",
+  "method_version": 1,
+  "formula": "categorized event durations grouped by category path; bridged gaps excluded",
+  "categories": [
+    {
+      "category_path": [
+        "A"
+      ],
+      "duration": 10,
+      "sessions": 1
+    },
+    {
+      "category_path": [
+        "z"
+      ],
+      "duration": 10,
+      "sessions": 1
+    },
+    {
+      "category_path": [
+        "é"
+      ],
+      "duration": 10,
+      "sessions": 1
+    },
+    {
+      "category_path": [
+        "😀"
+      ],
+      "duration": 10,
+      "sessions": 1
+    },
+    {
+      "category_path": [
+        ""
+      ],
+      "duration": 10,
+      "sessions": 1
+    }
+  ]
+}

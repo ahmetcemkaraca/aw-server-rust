@@ -13,6 +13,8 @@ use rocket::{get, put, State};
 use serde::Deserialize;
 
 use crate::endpoints::{HttpErrorJson, ServerState};
+use crate::config::AWConfig;
+use aw_entitlements::RuntimeFeatureAccessV1;
 
 const WORKSPACE_KEY: &str = "freelancer.workspace.v1";
 const REPORT_SIGNING_KEY: &str = "freelancer.report-signing-key.v1";
@@ -50,6 +52,78 @@ fn require_encrypted_vault(datastore: &Datastore) -> Result<(), HttpErrorJson> {
         return Err(HttpErrorJson::new(Status::ServiceUnavailable, "Freelancer projects require an encrypted local vault".into()));
     }
     Ok(())
+}
+
+fn with_freelancer_access<T>(
+    access: &RuntimeFeatureAccessV1,
+    action: impl FnOnce() -> Result<T, HttpErrorJson>,
+) -> Result<T, HttpErrorJson> {
+    let now = crate::feature_access::current_time()
+        .map_err(|message| HttpErrorJson::new(Status::ServiceUnavailable, message))?;
+    access
+        .with_feature_access("freelancer-workspace", now, action)
+        .map_err(|_| {
+            HttpErrorJson::new(
+                Status::Forbidden,
+                "A current signed Freelancer plan is required for this operation".into(),
+            )
+        })?
+}
+
+fn removal_only<T: PartialEq>(current: &[T], next: &[T]) -> bool {
+    let mut remaining = current.iter();
+    next.iter().all(|item| remaining.any(|old| old == item))
+}
+
+fn save_workspace(
+    datastore: &Datastore,
+    access: &RuntimeFeatureAccessV1,
+    mut request: UpdateWorkspaceRequestV1,
+) -> Result<Json<FreelancerWorkspaceV1>, HttpErrorJson> {
+    let (previous, current) = load_workspace(datastore)?;
+    if current.revision != request.expected_revision {
+        return Err(HttpErrorJson::new(
+            Status::Conflict,
+            "The local Freelancer workspace changed; reload before saving".into(),
+        ));
+    }
+    if current == request.workspace {
+        return Ok(Json(current));
+    }
+    // Deleting stored records never requires a plan; unchanged survivors retain their order.
+    let deleting = (request.workspace.projects.len() < current.projects.len()
+        || request.workspace.category_rules.len() < current.category_rules.len())
+        && removal_only(&current.projects, &request.workspace.projects)
+        && removal_only(&current.category_rules, &request.workspace.category_rules);
+    let save = || {
+        request.workspace.revision = request.expected_revision.checked_add(1).ok_or_else(|| {
+            HttpErrorJson::new(
+                Status::Conflict,
+                "The local Freelancer workspace revision is exhausted".into(),
+            )
+        })?;
+        let serialized = serde_json::to_string(&request.workspace).map_err(|_| {
+            HttpErrorJson::new(
+                Status::UnprocessableEntity,
+                "The local Freelancer workspace could not be encoded".into(),
+            )
+        })?;
+        if !datastore
+            .compare_and_set_key_value(WORKSPACE_KEY, previous.as_deref(), Some(&serialized))
+            .map_err(HttpErrorJson::from)?
+        {
+            return Err(HttpErrorJson::new(
+                Status::Conflict,
+                "The local Freelancer workspace changed; reload before saving".into(),
+            ));
+        }
+        Ok(Json(request.workspace))
+    };
+    if deleting {
+        save()
+    } else {
+        with_freelancer_access(access, save)
+    }
 }
 
 fn load_workspace(
@@ -156,86 +230,169 @@ pub fn get_workspace(
 pub async fn update_workspace(
     data: Data<'_>,
     state: &State<ServerState>,
+    config: &State<AWConfig>,
 ) -> Result<Json<FreelancerWorkspaceV1>, HttpErrorJson> {
     require_encrypted_vault(&state.datastore)?;
-    let body = data.open(MAX_WORKSPACE_REQUEST_BYTES.bytes()).into_string().await
-        .map_err(|_| HttpErrorJson::new(Status::BadRequest, "The local Freelancer workspace request is invalid".into()))?;
+    let body = data
+        .open(MAX_WORKSPACE_REQUEST_BYTES.bytes())
+        .into_string()
+        .await
+        .map_err(|_| {
+            HttpErrorJson::new(
+                Status::BadRequest,
+                "The local Freelancer workspace request is invalid".into(),
+            )
+        })?;
     if !body.is_complete() {
-        return Err(HttpErrorJson::new(Status::PayloadTooLarge, "The local Freelancer workspace is too large".into()));
+        return Err(HttpErrorJson::new(
+            Status::PayloadTooLarge,
+            "The local Freelancer workspace is too large".into(),
+        ));
     }
-    let mut request: UpdateWorkspaceRequestV1 = serde_json::from_str(&body.value)
-        .map_err(|_| HttpErrorJson::new(Status::UnprocessableEntity, "The local Freelancer workspace request is invalid".into()))?;
-    request.workspace.validate()
-        .map_err(|_| HttpErrorJson::new(Status::UnprocessableEntity, "The local Freelancer workspace is invalid".into()))?;
+    let request: UpdateWorkspaceRequestV1 = serde_json::from_str(&body.value).map_err(|_| {
+        HttpErrorJson::new(
+            Status::UnprocessableEntity,
+            "The local Freelancer workspace request is invalid".into(),
+        )
+    })?;
+    request.workspace.validate().map_err(|_| {
+        HttpErrorJson::new(
+            Status::UnprocessableEntity,
+            "The local Freelancer workspace is invalid".into(),
+        )
+    })?;
     if request.workspace.revision != request.expected_revision {
-        return Err(HttpErrorJson::new(Status::UnprocessableEntity, "The local Freelancer workspace revision is invalid".into()));
+        return Err(HttpErrorJson::new(
+            Status::UnprocessableEntity,
+            "The local Freelancer workspace revision is invalid".into(),
+        ));
     }
 
-    let (previous, current) = load_workspace(&state.datastore)?;
-    if current.revision != request.expected_revision {
-        return Err(HttpErrorJson::new(Status::Conflict, "The local Freelancer workspace changed; reload before saving".into()));
-    }
-    request.workspace.revision = request.expected_revision.checked_add(1)
-        .ok_or_else(|| HttpErrorJson::new(Status::Conflict, "The local Freelancer workspace revision is exhausted".into()))?;
-    let serialized = serde_json::to_string(&request.workspace)
-        .map_err(|_| HttpErrorJson::new(Status::UnprocessableEntity, "The local Freelancer workspace could not be encoded".into()))?;
-    let updated = state.datastore.compare_and_set_key_value(
-        WORKSPACE_KEY,
-        previous.as_deref(),
-        Some(&serialized),
-    ).map_err(HttpErrorJson::from)?;
-    if !updated {
-        return Err(HttpErrorJson::new(Status::Conflict, "The local Freelancer workspace changed; reload before saving".into()));
-    }
-    Ok(Json(request.workspace))
+    let datastore = state.datastore.clone();
+    let access = config.feature_access.clone();
+    rocket::tokio::task::spawn_blocking(move || save_workspace(&datastore, &access, request))
+        .await
+        .map_err(|_| {
+            HttpErrorJson::new(
+                Status::ServiceUnavailable,
+                "The local Freelancer workspace is unavailable".into(),
+            )
+        })?
 }
 
 #[post("/timesheet/preview", data = "<data>", format = "application/json")]
 pub async fn timesheet_preview(
     data: Data<'_>,
     state: &State<ServerState>,
+    config: &State<AWConfig>,
 ) -> Result<Json<TimesheetPreviewResponseV1>, HttpErrorJson> {
     require_encrypted_vault(&state.datastore)?;
-    let body = data.open(MAX_WORKSPACE_REQUEST_BYTES.bytes()).into_string().await
-        .map_err(|_| HttpErrorJson::new(Status::BadRequest, "The Approved Timesheet request is invalid".into()))?;
+    let body = data
+        .open(MAX_WORKSPACE_REQUEST_BYTES.bytes())
+        .into_string()
+        .await
+        .map_err(|_| {
+            HttpErrorJson::new(
+                Status::BadRequest,
+                "The Approved Timesheet request is invalid".into(),
+            )
+        })?;
     if !body.is_complete() {
-        return Err(HttpErrorJson::new(Status::PayloadTooLarge, "The Approved Timesheet is too large".into()));
+        return Err(HttpErrorJson::new(
+            Status::PayloadTooLarge,
+            "The Approved Timesheet is too large".into(),
+        ));
     }
-    let timesheet: ApprovedTimesheetV1 = serde_json::from_str(&body.value)
-        .map_err(|_| HttpErrorJson::new(Status::UnprocessableEntity, "The Approved Timesheet is invalid".into()))?;
-    timesheet.validate()
-        .map_err(|_| HttpErrorJson::new(Status::UnprocessableEntity, "The Approved Timesheet is invalid".into()))?;
-    let bytes = timesheet.artifact_bytes()
-        .map_err(|_| HttpErrorJson::new(Status::UnprocessableEntity, "The Approved Timesheet is invalid".into()))?;
-    let artifact_sha256 = digest(&SHA256, &bytes).as_ref().iter()
-        .map(|byte| format!("{byte:02x}")).collect();
-    let artifact_json = String::from_utf8(bytes)
-        .map_err(|_| HttpErrorJson::new(Status::UnprocessableEntity, "The Approved Timesheet is invalid".into()))?;
-    Ok(Json(TimesheetPreviewResponseV1 {
-        schema_version: 1,
-        timesheet,
-        artifact_sha256,
-        artifact_json,
-    }))
+    let timesheet: ApprovedTimesheetV1 = serde_json::from_str(&body.value).map_err(|_| {
+        HttpErrorJson::new(
+            Status::UnprocessableEntity,
+            "The Approved Timesheet is invalid".into(),
+        )
+    })?;
+    timesheet.validate().map_err(|_| {
+        HttpErrorJson::new(
+            Status::UnprocessableEntity,
+            "The Approved Timesheet is invalid".into(),
+        )
+    })?;
+    let access = config.feature_access.clone();
+    rocket::tokio::task::spawn_blocking(move || {
+        with_freelancer_access(&access, || {
+            let bytes = timesheet.artifact_bytes().map_err(|_| {
+                HttpErrorJson::new(
+                    Status::UnprocessableEntity,
+                    "The Approved Timesheet is invalid".into(),
+                )
+            })?;
+            let artifact_sha256 = digest(&SHA256, &bytes)
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let artifact_json = String::from_utf8(bytes).map_err(|_| {
+                HttpErrorJson::new(
+                    Status::UnprocessableEntity,
+                    "The Approved Timesheet is invalid".into(),
+                )
+            })?;
+            Ok(Json(TimesheetPreviewResponseV1 {
+                schema_version: 1,
+                timesheet,
+                artifact_sha256,
+                artifact_json,
+            }))
+        })
+    })
+    .await
+    .map_err(|_| {
+        HttpErrorJson::new(
+            Status::ServiceUnavailable,
+            "The Approved Timesheet preview is unavailable".into(),
+        )
+    })?
 }
 
 #[post("/timesheet/sign", data = "<data>", format = "application/json")]
 pub async fn sign_timesheet(
     data: Data<'_>,
     state: &State<ServerState>,
+    config: &State<AWConfig>,
 ) -> Result<Json<SignedClientReportV1>, HttpErrorJson> {
     require_encrypted_vault(&state.datastore)?;
-    let body = data.open(8.kilobytes()).into_string().await
-        .map_err(|_| HttpErrorJson::new(Status::BadRequest, "The Approved Timesheet request is invalid".into()))?;
+    let body = data.open(8.kilobytes()).into_string().await.map_err(|_| {
+        HttpErrorJson::new(
+            Status::BadRequest,
+            "The Approved Timesheet request is invalid".into(),
+        )
+    })?;
     if !body.is_complete() {
-        return Err(HttpErrorJson::new(Status::PayloadTooLarge, "The Approved Timesheet is too large".into()));
+        return Err(HttpErrorJson::new(
+            Status::PayloadTooLarge,
+            "The Approved Timesheet is too large".into(),
+        ));
     }
-    let timesheet: ApprovedTimesheetV1 = serde_json::from_str(&body.value)
-        .map_err(|_| HttpErrorJson::new(Status::UnprocessableEntity, "The Approved Timesheet is invalid".into()))?;
-    timesheet.validate()
-        .map_err(|_| HttpErrorJson::new(Status::UnprocessableEntity, "The Approved Timesheet is invalid".into()))?;
+    let timesheet: ApprovedTimesheetV1 = serde_json::from_str(&body.value).map_err(|_| {
+        HttpErrorJson::new(
+            Status::UnprocessableEntity,
+            "The Approved Timesheet is invalid".into(),
+        )
+    })?;
+    timesheet.validate().map_err(|_| {
+        HttpErrorJson::new(
+            Status::UnprocessableEntity,
+            "The Approved Timesheet is invalid".into(),
+        )
+    })?;
     let datastore = state.datastore.clone();
-    rocket::tokio::task::spawn_blocking(move || sign_report(&datastore, timesheet).map(Json))
-        .await
-        .map_err(|_| HttpErrorJson::new(Status::ServiceUnavailable, "The signed report is unavailable".into()))?
+    let access = config.feature_access.clone();
+    rocket::tokio::task::spawn_blocking(move || {
+        with_freelancer_access(&access, || sign_report(&datastore, timesheet).map(Json))
+    })
+    .await
+    .map_err(|_| {
+        HttpErrorJson::new(
+            Status::ServiceUnavailable,
+            "The signed report is unavailable".into(),
+        )
+    })?
 }

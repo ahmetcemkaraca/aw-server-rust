@@ -54,6 +54,10 @@ pub struct AWConfig {
     #[serde(default)]
     pub auth: AWAuthConfig,
 
+    /// Native release trust and billing metadata are never loaded from activity config.
+    #[serde(skip)]
+    pub feature_access: std::sync::Arc<aw_entitlements::RuntimeFeatureAccessV1>,
+
     // A mapping of watcher names to paths where the
     // custom visualizations are located.
     #[serde(default = "default_custom_static")]
@@ -67,6 +71,7 @@ impl Default for AWConfig {
             port: default_port(),
             testing: default_testing(),
             auth: AWAuthConfig::default(),
+            feature_access: std::sync::Arc::default(),
             cors: default_cors(),
             cors_regex: default_cors(),
             custom_static: default_custom_static(),

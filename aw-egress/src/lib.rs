@@ -267,7 +267,12 @@ pub fn evaluate(
     {
         return deny(policy_version, context.preview_id, EgressReasonCodeV1::InvalidPolicy);
     }
-    if has_secret(&request.payload).unwrap_or(true) {
+    // Validated sync packets contain only opaque binary fields, which can resemble tokens.
+    let opaque_sync = request.purpose_id == aw_models::SYNC_EGRESS_PURPOSE_V1
+        && request.payload.get("envelope").is_none_or(|value| value.is_null() || value.is_object())
+        && serde_json::from_value::<aw_models::SyncRelayRequestV1>(request.payload.clone())
+            .is_ok_and(|packet| packet.validate().is_ok());
+    if !opaque_sync && has_secret(&request.payload).unwrap_or(true) {
         return deny(policy_version, context.preview_id, EgressReasonCodeV1::SecretDetected);
     }
 
@@ -371,7 +376,11 @@ pub use plugin::{
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
 mod sync;
 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-pub use sync::EgressSyncRelayTransportV1;
+mod backup;
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+pub use backup::{BackupScopeV1,BackupTransferDirectionV1,BackupEgressPreviewV1,ReviewedBackupPermitV1};
+#[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+pub use sync::{EgressSyncRelayTransportV1,EgressBackupRelayTransportV1};
 
 #[cfg(all(test, any(feature = "encryption", feature = "encryption-vendored")))]
 mod sync_tests;

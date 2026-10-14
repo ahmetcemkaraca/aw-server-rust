@@ -67,3 +67,38 @@ fn invalid_bucket_leaves_all_source_buckets_unwritten() {
     assert!(store.import_buckets(source).is_err());
     assert!(store.get_buckets().unwrap().is_empty());
 }
+
+#[test]
+fn event_ranges_import_rejects_end_overflow_before_preview_or_any_write() {
+    let overflow = Event::new(
+        chrono::DateTime::from_timestamp_nanos(i64::MAX),
+        Duration::nanoseconds(1),
+        json!({"app": "synthetic"}).as_object().unwrap().clone(),
+    );
+    let source = export(vec![
+        bucket("valid.bucket", vec![event(Duration::seconds(1))]),
+        bucket("invalid.bucket", vec![overflow]),
+    ]);
+    for existing in [false, true] {
+        let store = Datastore::new_in_memory(false);
+        if existing {
+            store.create_bucket(&bucket("invalid.bucket", vec![event(Duration::seconds(1))])).unwrap();
+        }
+        let before = serde_json::to_value(store.get_buckets().unwrap()).unwrap();
+        let old_events = existing.then(|| store.get_events("invalid.bucket", None, None, None).unwrap());
+        assert!(matches!(
+            store.preview_import_buckets(source.clone()),
+            Err(aw_datastore::DatastoreError::InvalidImport(_))
+        ));
+        assert!(matches!(
+            store.import_buckets(source.clone()),
+            Err(aw_datastore::DatastoreError::InvalidImport(_))
+        ));
+        assert_eq!(serde_json::to_value(store.get_buckets().unwrap()).unwrap(), before);
+        if let Some(events) = old_events {
+            assert_eq!(store.get_events("invalid.bucket", None, None, None).unwrap(), events);
+        }
+        store.set_key_value("import-range-worker-health", "usable").unwrap();
+        store.lock().unwrap();
+    }
+}

@@ -7,6 +7,12 @@ use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+mod runtime;
+pub use runtime::{
+    EntitlementSourceV1, RuntimeFeatureAccessErrorV1, RuntimeFeatureAccessV1, StoredEntitlementV1,
+    ENTITLEMENT_REVOCATION_SCOPE_V1, MAX_STORED_ENTITLEMENT_BYTES_V1,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntitlementAccessV1 {

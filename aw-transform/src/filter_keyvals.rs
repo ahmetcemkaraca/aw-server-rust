@@ -12,19 +12,33 @@ use aw_models::Event;
 ///  input:  [a:1][a:2][a:3][b:4]
 ///  output: [a:1][a:2]
 /// ```
-pub fn filter_keyvals(mut events: Vec<Event>, key: &str, vals: &[Value]) -> Vec<Event> {
+pub fn filter_keyvals(events: Vec<Event>, key: &str, vals: &[Value]) -> Vec<Event> {
+    filter_keyvals_controlled(events, key, vals, &aw_models::QueryControl::unlimited())
+        .expect("unlimited key filter")
+}
+pub fn filter_keyvals_controlled(
+    mut events: Vec<Event>,
+    key: &str,
+    vals: &[Value],
+    control: &aw_models::QueryControl,
+) -> Result<Vec<Event>, aw_models::ReportExecutionErrorV1> {
+    control.checkpoint()?;
     let mut filtered_events = Vec::new();
     for event in events.drain(..) {
+        control.charge_fuel(1)?;
         if let Some(v) = event.data.get(key) {
             for val in vals {
+                control.charge_fuel(1)?;
                 if val == v {
+                    crate::report_merged_slot(filtered_events.len(), control)?;
                     filtered_events.push(event);
                     break;
                 }
             }
         }
     }
-    filtered_events
+    control.checkpoint()?;
+    Ok(filtered_events)
 }
 
 /// Drops events not matching the regex on the value for a specified key
@@ -61,19 +75,33 @@ pub fn filter_keyvals_regex(mut events: Vec<Event>, key: &str, regex: &Regex) ->
 ///  input:  [a:1][a:2][a:3][b:4]
 ///  output: [a:3][b:4]
 /// ```
-pub fn exclude_keyvals(mut events: Vec<Event>, key: &str, vals: &[Value]) -> Vec<Event> {
+pub fn exclude_keyvals(events: Vec<Event>, key: &str, vals: &[Value]) -> Vec<Event> {
+    exclude_keyvals_controlled(events, key, vals, &aw_models::QueryControl::unlimited())
+        .expect("unlimited key filter")
+}
+pub fn exclude_keyvals_controlled(
+    mut events: Vec<Event>,
+    key: &str,
+    vals: &[Value],
+    control: &aw_models::QueryControl,
+) -> Result<Vec<Event>, aw_models::ReportExecutionErrorV1> {
+    control.checkpoint()?;
     let mut filtered_events = Vec::new();
     'events: for event in events.drain(..) {
+        control.charge_fuel(1)?;
         if let Some(v) = event.data.get(key) {
             for val in vals {
+                control.charge_fuel(1)?;
                 if val == v {
                     continue 'events;
                 }
             }
         }
+        crate::report_merged_slot(filtered_events.len(), control)?;
         filtered_events.push(event);
     }
-    filtered_events
+    control.checkpoint()?;
+    Ok(filtered_events)
 }
 
 #[cfg(test)]

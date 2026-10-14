@@ -245,3 +245,170 @@ fn interpret_expr(
         }
     }
 }
+
+pub(crate) fn interpret_controlled(
+    p: Program,
+    ti: &TimeInterval,
+    source: &crate::FrozenQuerySource,
+    control: &aw_models::QueryControl,
+) -> Result<DataType, aw_models::ReportExecutionErrorV1> {
+    use aw_models::ReportExecutionErrorV1 as Error;
+    control.charge_bytes(
+        (128 + "TIMEINTERVAL".len() + std::mem::size_of::<(std::string::String, DataType)>())
+            as u64,
+    )?;
+    control.charge_values(1)?;
+    let mut env = HashMap::new();
+    let interval = ti.to_string();
+    env.insert("TIMEINTERVAL".into(), DataType::String(interval));
+    crate::functions::fill_controlled_env(&mut env, control)?;
+    for expr in p.stmts {
+        controlled_expr(&mut env, ti, source, control, expr)?;
+    }
+    let result = env.remove("RETURN").ok_or(Error::InternalError)?;
+    result.validate_controlled(control)?;
+    Ok(result)
+}
+fn controlled_expr(
+    env: &mut VarEnv,
+    ti: &TimeInterval,
+    source: &crate::FrozenQuerySource,
+    control: &aw_models::QueryControl,
+    expr: Expr,
+) -> Result<DataType, aw_models::ReportExecutionErrorV1> {
+    use crate::ast::Expr_::*;
+    use aw_models::ReportExecutionErrorV1 as Error;
+    control.charge_fuel(1)?;
+    let operator = match &expr.node {
+        Add(_, _) => 0,
+        Sub(_, _) => 1,
+        Mul(_, _) => 2,
+        Div(_, _) => 3,
+        Mod(_, _) => 4,
+        Equal(_, _) => 5,
+        _ => 255,
+    };
+    match expr.node {
+        Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Mod(a, b) | Equal(a, b) => {
+            let left = controlled_expr(env, ti, source, control, *a)?;
+            let right = controlled_expr(env, ti, source, control, *b)?;
+            match (operator, left, right) {
+                (0, DataType::List(mut a), DataType::List(mut b)) => {
+                    control.charge_values(b.len() as u64)?;
+                    control.charge_bytes(
+                        ((a.len() + b.len()) * std::mem::size_of::<DataType>()) as u64,
+                    )?;
+                    a.append(&mut b);
+                    Ok(DataType::List(a))
+                }
+                (0, DataType::String(mut a), DataType::String(b)) => {
+                    control.charge_bytes((a.len() + b.len()) as u64)?;
+                    a.push_str(&b);
+                    Ok(DataType::String(a))
+                }
+                (5, a, b) => {
+                    a.validate_controlled(control)?;
+                    b.validate_controlled(control)?;
+                    let equal = match (&a, &b) {
+                        (DataType::None(), DataType::None()) => false,
+                        (DataType::Bool(_), DataType::Bool(_))
+                        | (DataType::Number(_), DataType::Number(_))
+                        | (DataType::String(_), DataType::String(_))
+                        | (DataType::List(_), DataType::List(_))
+                        | (DataType::Dict(_), DataType::Dict(_))
+                        | (DataType::Event(_), DataType::Event(_)) => a == b,
+                        _ => return Err(Error::InternalError),
+                    };
+                    control.checkpoint()?;
+                    Ok(DataType::Bool(equal))
+                }
+                (op, DataType::Number(a), DataType::Number(b)) => {
+                    let n = match op {
+                        0 => a + b,
+                        1 => a - b,
+                        2 => a * b,
+                        3 => a / b,
+                        4 => a % b,
+                        _ => return Err(Error::InternalError),
+                    };
+                    if n.is_finite() {
+                        Ok(DataType::Number(n))
+                    } else {
+                        Err(Error::InternalError)
+                    }
+                }
+                _ => Err(Error::InternalError),
+            }
+        }
+        Var(name) => {
+            let value = env.get(&name).ok_or(Error::InternalError)?;
+            value.charge_copy(control)?;
+            Ok(value.clone())
+        }
+        Assign(name, value) => {
+            let value = controlled_expr(env, ti, source, control, *value)?;
+            control.charge_values(1)?;
+            control.charge_bytes(
+                (name.len() + std::mem::size_of::<(std::string::String, DataType)>()) as u64,
+            )?;
+            env.insert(name, value);
+            Ok(DataType::None())
+        }
+        Return(value) => {
+            let value = controlled_expr(env, ti, source, control, *value)?;
+            control.charge_values(1)?;
+            control.charge_bytes(
+                ("RETURN".len() + std::mem::size_of::<(std::string::String, DataType)>()) as u64,
+            )?;
+            env.insert("RETURN".into(), value);
+            Ok(DataType::None())
+        }
+        Function(name, args) => {
+            let canonical = match env.get(&name) {
+                Some(DataType::Function(name, _)) => name.as_str(),
+                _ => return Err(Error::InternalError),
+            };
+            control.charge_bytes(canonical.len() as u64)?;
+            let canonical = canonical.to_owned();
+            let args = controlled_expr(env, ti, source, control, *args)?.controlled_list()?;
+            crate::functions::dispatch_controlled(&canonical, args, env, ti, source, control)
+        }
+        If(branches) => {
+            for (condition, body) in branches {
+                let condition = controlled_expr(env, ti, source, control, *condition)?;
+                let DataType::Bool(truth) = condition else {
+                    return Err(Error::InternalError);
+                };
+                if truth {
+                    for item in body {
+                        controlled_expr(env, ti, source, control, item)?;
+                    }
+                    break;
+                }
+            }
+            Ok(DataType::None())
+        }
+        Bool(value) => Ok(DataType::Bool(value)),
+        Number(value) => Ok(DataType::Number(value)),
+        String(value) => Ok(DataType::String(value)),
+        List(items) => {
+            let mut output = Vec::new();
+            for item in items {
+                control.charge_values(1)?;
+                control.charge_bytes(std::mem::size_of::<DataType>() as u64)?;
+                output.push(controlled_expr(env, ti, source, control, item)?);
+            }
+            Ok(DataType::List(output))
+        }
+        Dict(items) => {
+            let mut output = HashMap::new();
+            for (key, item) in items {
+                control.charge_values(1)?;
+                control
+                    .charge_bytes(std::mem::size_of::<(std::string::String, DataType)>() as u64)?;
+                output.insert(key, controlled_expr(env, ti, source, control, item)?);
+            }
+            Ok(DataType::Dict(output))
+        }
+    }
+}

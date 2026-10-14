@@ -203,6 +203,7 @@ fn baseline_resumes_and_journals_post_watermark_inserts_once() {
     assert_eq!(store.list_sync_operations(device_id, 1, 0, 16).unwrap().len(), 0);
 
     let started = store.begin_sync_baseline().unwrap();
+    let seed_cursor = store.list_sync_operations(device_id, 1, 0, 256).unwrap().last().unwrap().counter;
     assert_eq!(started.baseline_max_event_id, original[1].id.unwrap() as u64);
     let first = store.process_sync_baseline_batch(1).unwrap();
     assert!(!first.complete);
@@ -213,7 +214,7 @@ fn baseline_resumes_and_journals_post_watermark_inserts_once() {
     assert!(new_event[0].id.unwrap() as u64 > started.baseline_max_event_id);
     while !resumed.process_sync_baseline_batch(1).unwrap().complete {}
 
-    let operations = resumed.list_sync_operations(device_id, 1, 0, 16).unwrap();
+    let operations = resumed.list_sync_operations(device_id, 1, seed_cursor, 16).unwrap();
     assert_eq!(operations.len(), 3);
     let mut event_ids = operations.iter().map(|stored| {
         serde_json::from_str::<serde_json::Value>(&stored.operation_json).unwrap()["local_event_id"]
@@ -232,6 +233,7 @@ fn correction_of_an_unscanned_baseline_event_journals_full_state_first() {
     let events = (0..65).map(|index| event(&format!("before-{index}"))).collect::<Vec<_>>();
     let inserted = store.insert_events(bucket_id, &events).unwrap();
     store.begin_sync_baseline().unwrap();
+    let seed_cursor = store.list_sync_operations(device_id, 1, 0, 256).unwrap().last().unwrap().counter;
 
     let last_id = inserted.last().unwrap().id.unwrap();
     let mut corrected = store.get_events(bucket_id, None, None, None).unwrap()
@@ -239,7 +241,7 @@ fn correction_of_an_unscanned_baseline_event_journals_full_state_first() {
     corrected.data.insert("app".into(), serde_json::json!("corrected-before-scan"));
     store.correct_event(bucket_id, corrected).unwrap();
 
-    let operations = store.list_sync_operations(device_id, 1, 0, 8).unwrap();
+    let operations = store.list_sync_operations(device_id, 1, seed_cursor, 8).unwrap();
     let operation: aw_sync_e2ee::SyncOperationV1 = serde_json::from_str(&operations[0].operation_json).unwrap();
     assert_eq!(operation.kind, aw_models::SyncOperationKindV1::Upsert);
     assert!(operation.fields.contains_key("timestamp"));
@@ -254,6 +256,7 @@ fn correction_of_an_unscanned_baseline_event_journals_full_state_first() {
 fn local_event_and_outbox_insert_roll_back_together() {
     let (store, path, key, device_id) = sync_store("sync-local-atomic");
     store.begin_sync_baseline().unwrap();
+    let seed_history = store.list_sync_operations(device_id, 1, 0, 256).unwrap();
     store.lock().unwrap();
 
     let conn = rusqlite::Connection::open(&path).unwrap();
@@ -264,7 +267,7 @@ fn local_event_and_outbox_insert_roll_back_together() {
     let reopened = Datastore::open_encrypted(path.to_string_lossy().into_owned(), key).unwrap();
     assert!(reopened.insert_events("local-sync-bucket", &[event("must-rollback")]).is_err());
     assert!(reopened.get_events("local-sync-bucket", None, None, None).unwrap().is_empty());
-    assert!(reopened.list_sync_operations(device_id, 1, 0, 16).unwrap().is_empty());
+    assert_eq!(reopened.list_sync_operations(device_id, 1, 0, 256).unwrap(), seed_history);
     reopened.lock().unwrap();
     std::fs::remove_file(path).unwrap();
 }
@@ -274,9 +277,11 @@ fn key_rotation_starts_a_fresh_baseline_without_resetting_device_counters() {
     let (store, path, _, device_id) = sync_store("sync-baseline-rotation");
     store.insert_events("local-sync-bucket", &[event("before-rotation")]).unwrap();
     let first = store.begin_sync_baseline().unwrap();
+    let first_seed_cursor = store.list_sync_operations(device_id, 1, 0, 256).unwrap().last().unwrap().counter;
     assert!(!first.complete);
     while !store.process_sync_baseline_batch(8).unwrap().complete {}
-    assert_eq!(store.list_sync_operations(device_id, 1, 0, 8).unwrap()[0].counter, 1);
+    assert_eq!(store.list_sync_operations(device_id, 1, first_seed_cursor, 8).unwrap()[0].counter, first_seed_cursor + 1);
+    let first_history = store.list_sync_operations(device_id, 1, 0, 256).unwrap();
 
     let snapshot = SyncSnapshotV1::new([0xC8; 16], vec![SyncEnvelopeV1 {
         schema_version: 1,
@@ -295,11 +300,13 @@ fn key_rotation_starts_a_fresh_baseline_without_resetting_device_counters() {
     assert!(!store.sync_enabled().unwrap());
 
     let restarted = store.begin_sync_baseline().unwrap();
+    let second_seed_cursor = store.list_sync_operations(device_id, 2, 0, 256).unwrap().last().unwrap().counter;
     assert!(!restarted.complete);
     assert_eq!(restarted.baseline_max_event_id, first.baseline_max_event_id);
     assert!(store.process_sync_baseline_batch(8).unwrap().complete);
-    assert_eq!(store.list_sync_operations(device_id, 2, 0, 8).unwrap()[0].counter, 2);
-    assert_eq!(store.list_sync_operations(device_id, 1, 0, 8).unwrap()[0].counter, 1);
+    assert_eq!(store.list_sync_operations(device_id, 2, second_seed_cursor, 8).unwrap()[0].counter, second_seed_cursor + 1);
+    assert!(second_seed_cursor > first_history.last().unwrap().counter);
+    assert_eq!(store.list_sync_operations(device_id, 1, 0, 256).unwrap(), first_history);
     store.lock().unwrap();
     std::fs::remove_file(path).unwrap();
 }

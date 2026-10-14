@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::thread;
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::DateTime;
@@ -23,6 +23,7 @@ use aw_models::{
     PluginStorageIntentV1, PluginWriteIntentV1,
 };
 const CAPTURE_KEY: &str = "peakactivity.capture_policy";
+const PRIVACY_FILTERS_KEY: &str = "settings.privacy_filters";
 const EGRESS_KEY_PREFIX: &str = "egress.";
 
 use crate::privacy_filter::PrivacyFilterEngine;
@@ -66,6 +67,8 @@ type RequestReceiver = mpsc_requests::RequestReceiver<Command, Result<Response, 
 pub struct Datastore {
     worker: Arc<RwLock<Option<Worker>>>,
     encrypted: Arc<AtomicBool>,
+    report_invalidator: Arc<RwLock<Option<Arc<dyn Fn()+Send+Sync>>>>,
+    report_runtime: Arc<Mutex<Option<Weak<dyn std::any::Any+Send+Sync>>>>,
 }
 
 struct Worker {
@@ -79,6 +82,50 @@ pub struct EgressLease<'a> {
 }
 
 impl EgressLease<'_> {
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn sync_backup_provider_intent(&self,context:String,bundle:String)->Result<Option<aw_sync_e2ee::EncryptedSyncSnapshotV1>,DatastoreError>{match self.request(Command::GetSyncBackupProviderIntent(context,bundle))?{Response::SyncBackupProviderIntent(record)=>Ok(record),_=>Err(DatastoreError::InternalError("Unexpected backup retry record".into()))}}
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn ensure_sync_backup_not_deleted(&self,context:String,vault:String,epoch:u64,snapshot:String,objects:Vec<String>)->Result<(),DatastoreError>{match self.request(Command::EnsureSyncBackupNotDeleted(context,vault,epoch,snapshot,objects))?{Response::Empty()=>Ok(()),_=>Err(DatastoreError::InternalError("Unexpected backup deletion admission".into()))}}
+
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn list_sync_backup_deletions(&self,context:String,cursor:Option<crate::SyncBackupDeletionCursorV1>,limit:usize)->Result<crate::SyncBackupDeletionPageV1,DatastoreError>{match self.request(Command::ListSyncBackupDeletions(context,cursor,limit))?{Response::SyncBackupDeletionPage(page)=>Ok(page),_=>Err(DatastoreError::InternalError("Unexpected backup deletion page".into()))}}
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn export_sync_backup_deletions(&self,context:String)->Result<Vec<aw_models::SnapshotDeletionFactV1>,DatastoreError>{match self.request(Command::ExportSyncBackupDeletions(context))?{Response::SyncBackupDeletions(facts)=>Ok(facts),_=>Err(DatastoreError::InternalError("Unexpected backup deletion export".into()))}}
+
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn sync_backup_deletion(&self,id:String)->Result<Option<aw_models::SnapshotDeletionFactV1>,DatastoreError>{match self.request(Command::GetSyncBackupDeletion(id))?{Response::SyncBackupDeletion(fact)=>Ok(fact),_=>Err(DatastoreError::InternalError("Unexpected backup deletion metadata".into()))}}
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn sync_policy_context(&self)->Result<aw_models::SyncPolicyContextV1,DatastoreError> {
+        match self.request(Command::GetSyncPolicyContext)? {
+            Response::SyncPolicyContext(context)=>Ok(context),
+            _=>Err(DatastoreError::InternalError("Unexpected sync context response".into())),
+        }
+    }
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn sync_backup_source(&self) -> Result<crate::SyncBackupSourceStateV1, DatastoreError> {
+        match self.request(Command::ReadSyncBackupSource)? {
+            Response::SyncBackupSource(state) => Ok(state),
+            _ => Err(DatastoreError::InternalError("Unexpected backup source response".into())),
+        }
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn sync_backup_objects(&self, vault_id: String, after: Option<String>, limit: usize) -> Result<SyncObjectPageV1, DatastoreError> {
+        match self.request(Command::ListSyncBackupObjects(vault_id, after, limit))? {
+            Response::SyncObjectsPage(page) => Ok(page),
+            _ => Err(DatastoreError::InternalError("Unexpected backup object response".into())),
+        }
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn sync_backup_object(&self, object_id: String) -> Result<Option<aw_models::SyncEnvelopeV1>, DatastoreError> {
+        match self.request(Command::GetSyncBackupObject(object_id))? {
+            Response::SyncObject(object) => Ok(object),
+            _ => Err(DatastoreError::InternalError("Unexpected selected backup response".into())),
+        }
+    }
+
     fn request(&self, command: Command) -> Result<Response, DatastoreError> {
         let worker = self.worker.as_ref().ok_or(DatastoreError::Locked)?;
         let receiver = worker.requester.request(command)
@@ -132,6 +179,31 @@ impl fmt::Debug for Datastore {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum Response {
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    SyncBackupDeletionPage(crate::SyncBackupDeletionPageV1),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    SyncBackupDeletions(Vec<aw_models::SnapshotDeletionFactV1>),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    SyncBackupContinuity(crate::SyncBackupContinuityV1),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    SyncBackupProviderIntent(Option<aw_sync_e2ee::EncryptedSyncSnapshotV1>),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    SyncBackupDeletion(Option<aw_models::SnapshotDeletionFactV1>),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    SyncBackupSource(crate::SyncBackupSourceStateV1),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    SyncPolicyContext(aw_models::SyncPolicyContextV1),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    SyncPolicyCandidates(aw_models::SyncPolicyCandidatePageV1),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    SyncPolicyPreview(aw_models::SyncPolicyPreviewV1),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    SyncRecoveryPolicySummary(aw_models::SyncRecoveryPolicySummaryV1),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    SyncPolicyChoice(aw_models::SyncPolicyChoiceResultV1),
+    ReportLibrary(Result<crate::reports::ReportResponseV1, aw_models::ReportExecutionErrorV1>),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    ManualProjection(crate::ManualProjectionResultV1),
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
     Plugin(crate::plugins::PluginResultV1),
     Empty(),
@@ -212,8 +284,51 @@ pub struct ImportSummary {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum Command {
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    EnsureSyncBackupNotDeleted(String,String,u64,String,Vec<String>),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    ListSyncBackupDeletions(String,Option<crate::SyncBackupDeletionCursorV1>,usize),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    ExportSyncBackupDeletions(String),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    MergeSyncBackupDeletions(String,Vec<aw_models::SnapshotDeletionFactV1>,String),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    DeleteSyncBackup(String,aw_sync_e2ee::SnapshotDeletionProofV1,String),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    RecordSyncBackupDeletionIntent(String,aw_sync_e2ee::SnapshotDeletionProofV1,String),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    RecordSyncBackupProviderIntent(String,aw_sync_e2ee::SnapshotDeletionProofV1,aw_sync_e2ee::EncryptedSyncSnapshotV1,String),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    ExportSyncBackupContinuity(String),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    MergeSyncBackupContinuity(String,crate::SyncBackupContinuityV1,String),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    GetSyncBackupProviderIntent(String,String),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    GetSyncBackupDeletion(String),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    ReadSyncBackupSource,
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    ListSyncBackupObjects(String, Option<String>, usize),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    GetSyncBackupObject(String),
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    StageSyncBackupObjects(String,Vec<aw_models::SyncEnvelopeV1>,String),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    GetSyncPolicyContext,
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    ListSyncPolicyCandidates(Option<String>,usize),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    PreviewSyncPolicyCandidate(String),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    PreviewSyncRecoveryPolicy(SyncRecoveryStateV1,[u8;16],u64,[u8;16],bool),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    ChooseSyncPolicy(aw_models::SyncPolicyChoiceRequestV1,Option<crate::SyncPolicyActivationGateV1>),
+    Report(crate::reports::ReportOperationV1),
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    ReconcileManualEntries(Vec<crate::ManualActivityEntryV1>),
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
     Plugin(crate::plugins::PluginOperationV1),
     CreateBucket(Bucket),
@@ -227,7 +342,7 @@ pub(crate) enum Command {
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
     RestoreSyncSnapshotData(BucketsExport),
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-    RestoreSyncRecoveryData(BucketsExport, SyncKeyMaterial, SyncSnapshotV1, SyncRecoveryStateV1, SyncDeviceIdentity),
+    RestoreSyncRecoveryData(BucketsExport, SyncKeyMaterial, SyncSnapshotV1, SyncRecoveryStateV1, SyncDeviceIdentity, Option<String>,Option<String>),
     CorrectEvent(String, Event),
     SplitEvent(String, i64, DateTime<Utc>),
     MergeEvents(String, i64, i64),
@@ -368,6 +483,7 @@ pub(crate) enum Command {
 
 impl Command {
     fn requires_encrypted_vault(&self) -> bool {
+        if matches!(self, Self::Report(_)) { return true; }
         if matches!(self,
             Self::GetAISettings() | Self::CompareAndSetAISettings(_, _)
                 | Self::GetAIInsightHistory() | Self::SaveAIInsight(_) | Self::DeleteAIInsight(_)
@@ -378,7 +494,8 @@ impl Command {
         {
             matches!(
                 self,
-                Self::Plugin(_)
+                Self::EnsureSyncBackupNotDeleted(_,_,_,_,_) | Self::ListSyncBackupDeletions(_,_,_) | Self::ExportSyncBackupDeletions(_) | Self::MergeSyncBackupDeletions(_,_,_) | Self::DeleteSyncBackup(_,_,_) | Self::ExportSyncBackupContinuity(_) | Self::MergeSyncBackupContinuity(_,_,_) | Self::RecordSyncBackupProviderIntent(_,_,_,_) | Self::GetSyncBackupProviderIntent(_,_) | Self::RecordSyncBackupDeletionIntent(_,_,_) | Self::GetSyncBackupDeletion(_) | Self::StageSyncBackupObjects(_,_,_) | Self::ReadSyncBackupSource | Self::ListSyncBackupObjects(_,_,_) | Self::GetSyncBackupObject(_) | Self::GetSyncPolicyContext | Self::ListSyncPolicyCandidates(_,_) | Self::PreviewSyncPolicyCandidate(_) | Self::PreviewSyncRecoveryPolicy(_,_,_,_,_) | Self::ChooseSyncPolicy(_,_) | Self::Plugin(_)
+                    | Self::ReconcileManualEntries(_)
                     | Self::GetPluginStorage(_)
                     | Self::ApplyPluginStorageIntents(_, _)
                     | Self::DeletePluginStorage(_)
@@ -386,7 +503,7 @@ impl Command {
                     | Self::ApplyPluginWriteIntents(_, _)
                     | Self::DeletePluginData(_)
                     | Self::RestoreSyncSnapshotData(_)
-                    | Self::RestoreSyncRecoveryData(_, _, _, _, _)
+                    | Self::RestoreSyncRecoveryData(_, _, _, _, _, _,_)
                     | Self::GetSyncDeviceIdentity()
                     | Self::CreateSyncDeviceIdentity(_)
                     | Self::GetSyncKeyMaterial()
@@ -469,7 +586,9 @@ struct DatastoreWorker {
     commit: bool,
     last_heartbeat: HashMap<String, Option<Event>>,
     privacy_engine: PrivacyFilterEngine,
+    pending_privacy_engine: Option<PrivacyFilterEngine>,
     capture_policy: Option<CapturePolicy>,
+    pending_capture_policy: Option<CapturePolicy>,
     capture_breaks: HashSet<String>,
 }
 
@@ -486,7 +605,9 @@ impl DatastoreWorker {
             commit: false,
             last_heartbeat: HashMap::new(),
             privacy_engine: PrivacyFilterEngine::new(vec![]),
+            pending_privacy_engine: None,
             capture_policy: None,
+            pending_capture_policy: None,
             capture_breaks: HashSet::new(),
         }
     }
@@ -567,6 +688,11 @@ impl DatastoreWorker {
             }
         }
 
+        self.privacy_engine = match Self::stored_privacy_engine(&ds,&conn) {
+            Ok(engine) => engine,
+            Err(_) => { error!("Invalid or unavailable saved privacy controls; datastore startup stopped"); return; },
+        };
+
         // Start handling and respond to requests
         loop {
             let last_commit_time: DateTime<Utc> = Utc::now();
@@ -593,6 +719,7 @@ impl DatastoreWorker {
             // Native capture writes also wait for commit; legacy batching is
             // retained only when the explicit native capture policy is absent.
             let mut deferred_ack = None;
+            let mut report_pending = None;
             loop {
                 let (request, response_sender) = match self.responder.poll() {
                     Ok((req, res_sender)) => (req, res_sender),
@@ -603,7 +730,18 @@ impl DatastoreWorker {
                         break;
                     }
                 };
+                if matches!(&request, Command::Report(_)) && !encrypted {
+                    response_sender.respond(Ok(Response::ReportLibrary(Err(aw_models::ReportExecutionErrorV1::SourceUnavailable))));
+                    continue;
+                }
+                if matches!(&request, Command::Report(operation) if operation.owns_transaction()) {
+                    report_pending = Some((request, response_sender));
+                    break;
+                }
                 let correction_write = matches!(&request, Command::InsertEvents(_, events) if events.iter().any(|event| event.id.is_some()));
+                let privacy_change = matches!(&request,
+                    Command::SetKeyValue(key,_) | Command::CompareAndSetKeyValue(key,_,_) | Command::DeleteKeyValue(key) if key == PRIVACY_FILTERS_KEY)
+                    || matches!(&request,Command::RefreshPrivacyFilter());
                 // ponytail: commit each native vault write before acknowledging it;
                 // add batched durable receipts only if collector throughput requires them.
                 let commit_sensitive = matches!(
@@ -650,12 +788,15 @@ impl DatastoreWorker {
                             | Command::MigrateHostname(_)
                             | Command::MigrateTestBucketNames()
                     );
-                let ack_after_commit = correction_write || commit_sensitive || native_capture_commit;
+                let ack_after_commit = correction_write || commit_sensitive || native_capture_commit || privacy_change;
                 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
                 let ack_after_commit = ack_after_commit
+                    || (encrypted && matches!(&request,Command::SetKeyValue(key,_) | Command::DeleteKeyValue(key)
+                        if crate::sync_policy::PORTABLE_SETTING_KEYS_V1.contains(&key.as_str())))
                     || matches!(
                         &request,
                         Command::Plugin(_)
+                            | Command::ReconcileManualEntries(_)
                             | Command::ApplyPluginStorageIntents(_, _)
                             | Command::DeletePluginStorage(_)
                             | Command::ApplyPluginWriteIntents(_, _)
@@ -663,12 +804,18 @@ impl DatastoreWorker {
                             | Command::CreateSyncDeviceIdentity(_)
                             | Command::InstallSyncKeyMaterial(_)
                             | Command::RestoreSyncSnapshotData(_)
-                            | Command::RestoreSyncRecoveryData(_, _, _, _, _)
+                            | Command::RestoreSyncRecoveryData(_, _, _, _, _, _,_)
                             | Command::PrepareSyncSnapshotMappings()
                             | Command::SaveSyncSnapshot(_, _)
                             | Command::InstallSyncRecovery(_, _)
                             | Command::RotateSyncKeyMaterial(_, _, _, _)
                             | Command::PutSyncObject(_, _)
+                            | Command::StageSyncBackupObjects(_,_,_)
+                            | Command::DeleteSyncBackup(_,_,_)
+                            | Command::MergeSyncBackupContinuity(_,_,_)
+                            | Command::RecordSyncBackupProviderIntent(_,_,_,_)
+                            | Command::RecordSyncBackupDeletionIntent(_,_,_)
+                            | Command::MergeSyncBackupDeletions(_,_,_)
                             | Command::DeleteSyncObjectAfterTombstones(_, _, _)
                             | Command::SetSyncEnabled(_, _, _)
                             | Command::ConfirmSyncRecoverySaved(_)
@@ -680,6 +827,7 @@ impl DatastoreWorker {
                             | Command::BeginSyncBaseline()
                             | Command::ProcessSyncBaselineBatch(_)
                             | Command::ApplySyncOperations(_)
+                            | Command::ChooseSyncPolicy(_, _)
                     );
                 let response = self.handle_request(request, &mut ds, &tx);
                 if ack_after_commit {
@@ -703,13 +851,26 @@ impl DatastoreWorker {
                 "Committing DB! Force commit {}, {} uncommitted events",
                 self.commit, self.uncommitted_events
             );
-            match tx.commit() {
+            let committed = match tx.commit() {
                 Ok(_) => {
+                    if let Some(policy) = self.pending_capture_policy.take() {
+                        self.capture_policy = Some(policy);
+                        self.last_heartbeat.clear();
+                        self.capture_breaks.clear();
+                    }
+                    if let Some(engine) = self.pending_privacy_engine.take() {
+                        self.privacy_engine = engine;
+                        self.last_heartbeat.clear();
+                        self.capture_breaks.extend(ds.get_buckets().into_keys());
+                    }
                     if let Some((sender, response)) = deferred_ack.take() {
                         sender.respond(response);
                     }
+                    true
                 }
                 Err(err) => {
+                    self.pending_privacy_engine = None;
+                    self.pending_capture_policy = None;
                     if let Some(policy) = &mut self.capture_policy { policy.recording = false; }
                     self.last_heartbeat.clear();
                     error!(
@@ -723,7 +884,13 @@ impl DatastoreWorker {
                             "Failed to commit datastore transaction: {err}"
                         ))));
                     }
+                    false
                 }
+            };
+            if let Some((request, sender)) = report_pending {
+                let result = if !committed { Err(aw_models::ReportExecutionErrorV1::DataIntegrity) }
+                    else { match request { Command::Report(operation) => operation.execute_owned(&mut conn, &ds), _ => Err(aw_models::ReportExecutionErrorV1::InternalError) } };
+                sender.respond(Ok(Response::ReportLibrary(result)));
             }
             if self.quit {
                 break;
@@ -744,12 +911,26 @@ impl DatastoreWorker {
         }
     }
 
+    fn parsed_privacy_engine(value: &str) -> Result<PrivacyFilterEngine, DatastoreError> {
+        PrivacyFilterEngine::from_json(value)
+            .map_err(|_| DatastoreError::InvalidImport("Invalid privacy filter configuration".into()))
+    }
+
+    fn stored_privacy_engine(ds: &DatastoreInstance, conn: &Connection) -> Result<PrivacyFilterEngine, DatastoreError> {
+        match ds.get_key_value(conn,PRIVACY_FILTERS_KEY) {
+            Ok(value) => Self::parsed_privacy_engine(&value),
+            Err(DatastoreError::NoSuchKey(_)) => Ok(PrivacyFilterEngine::new(vec![])),
+            Err(error) => Err(error),
+        }
+    }
+
     fn plan_import(
         &self,
         ds: &mut DatastoreInstance,
         tx: &Transaction,
         source: BucketsExport,
         apply_filters: bool,
+        preserve_event_ids: bool,
     ) -> Result<ImportPlan, DatastoreError> {
         let mut summary = ImportSummary::default();
         let mut planned = Vec::new();
@@ -766,13 +947,9 @@ impl DatastoreWorker {
 
             let mut filtered = Vec::with_capacity(input.len());
             for event in input {
-                if event.duration < Duration::zero()
-                    || event.duration.num_nanoseconds().is_none()
-                    || event.timestamp.timestamp_nanos_opt().is_none()
-                    || event.timestamp.checked_add_signed(event.duration).is_none()
-                {
-                    return Err(DatastoreError::InvalidImport("An event has an invalid timestamp or duration".into()));
-                }
+                crate::datastore::event_storage_times(&event).map_err(|_| {
+                    DatastoreError::InvalidImport("An event has an invalid timestamp or duration".into())
+                })?;
                 let original = event.clone();
                 let filtered_event = if apply_filters {
                     self.filter_event(&bucket.id, event, false)
@@ -782,7 +959,7 @@ impl DatastoreWorker {
                 match filtered_event {
                     Some(mut event) => {
                         let changed = event != original;
-                        event.id = None;
+                        if !preserve_event_ids { event.id = None; }
                         filtered.push((event, changed));
                     }
                     None => summary.events_skipped += 1,
@@ -837,8 +1014,9 @@ impl DatastoreWorker {
         source: BucketsExport,
         commit: bool,
         apply_filters: bool,
+        preserve_event_ids: bool,
     ) -> Result<ImportSummary, DatastoreError> {
-        let plan = self.plan_import(ds, tx, source, apply_filters)?;
+        let plan = self.plan_import(ds, tx, source, apply_filters, preserve_event_ids)?;
         if !commit { return Ok(plan.summary); }
 
         tx.execute_batch("SAVEPOINT peakactivity_import")
@@ -1026,9 +1204,7 @@ impl DatastoreWorker {
             .ok_or_else(|| DatastoreError::InternalError("Capture policy revision exhausted".into()))?;
         policy.effective_from = Utc::now();
         ds.insert_key_value(tx, CAPTURE_KEY, &serde_json::to_string(&policy).unwrap())?;
-        self.capture_policy = Some(policy.clone());
-        self.last_heartbeat.clear();
-        self.capture_breaks.clear();
+        self.pending_capture_policy = Some(policy.clone());
         self.commit = true;
         Ok(Response::CapturePolicy(policy))
     }
@@ -1040,6 +1216,61 @@ impl DatastoreWorker {
         tx: &Transaction,
     ) -> Result<Response, DatastoreError> {
         match request {
+            #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+            Command::EnsureSyncBackupNotDeleted(context,vault,epoch,snapshot,objects)=>ds.ensure_sync_backup_not_deleted(tx,&context,&vault,epoch,&snapshot,&objects).map(|_|Response::Empty()),
+            #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+            Command::ListSyncBackupDeletions(context,cursor,limit)=>ds.list_sync_backup_deletions(tx,&context,cursor.as_ref(),limit).map(Response::SyncBackupDeletionPage),
+            #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+            Command::ExportSyncBackupDeletions(context)=>ds.export_sync_backup_deletions(tx,&context).map(Response::SyncBackupDeletions),
+            #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+            Command::MergeSyncBackupDeletions(context,facts,at)=>{let count=ds.merge_sync_backup_deletions(tx,&context,&facts,&at)?;self.commit|=count>0;Ok(Response::SyncCounter(count as u64))}
+            #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+            Command::RecordSyncBackupProviderIntent(context,proof,record,at)=>{ds.record_sync_backup_provider_intent(tx,&context,&proof,&record,&at)?;self.commit=true;Ok(Response::Empty())},
+            #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+            Command::ExportSyncBackupContinuity(context)=>ds.export_sync_backup_continuity(tx,&context).map(Response::SyncBackupContinuity),
+            #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+            Command::MergeSyncBackupContinuity(context,state,at)=>{ds.merge_sync_backup_continuity(tx,&context,state,&at)?;self.commit=true;Ok(Response::Empty())},
+            #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+            Command::GetSyncBackupProviderIntent(context,bundle)=>ds.get_sync_backup_provider_intent(tx,&context,&bundle).map(Response::SyncBackupProviderIntent),
+            #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+            Command::GetSyncBackupDeletion(id)=>ds.get_sync_backup_deletion(tx,&id).map(Response::SyncBackupDeletion),
+            #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+            Command::RecordSyncBackupDeletionIntent(context,proof,at)=>{let count=ds.record_sync_backup_deletion_intent(tx,&context,&proof,&at)?;self.commit|=count>0;Ok(Response::SyncCounter(count as u64))}
+            #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+            Command::DeleteSyncBackup(context,proof,at)=>{
+                let count=ds.delete_sync_backup(tx,&context,&proof,&at)?;self.commit|=count>0;Ok(Response::SyncCounter(count as u64))
+            }
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            Command::ReadSyncBackupSource => ds.read_sync_backup_source(tx).map(Response::SyncBackupSource),
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            Command::ListSyncBackupObjects(vault,after,limit) => ds.list_sync_backup_objects(tx,&vault,after.as_deref(),limit).map(Response::SyncObjectsPage),
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            Command::GetSyncBackupObject(id) => ds.get_sync_backup_object(tx,&id).map(Response::SyncObject),
+            #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+            Command::StageSyncBackupObjects(context,objects,at)=> {
+                let count=ds.stage_sync_backup_objects(tx,&context,&objects,&at)?;
+                self.commit|=count>0;
+                Ok(Response::SyncCounter(count as u64))
+            }
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            Command::GetSyncPolicyContext => Ok(Response::SyncPolicyContext(aw_models::SyncPolicyContextV1 {
+                schema_version: 1,
+                context_id: ds.policy_context.iter().map(|byte|format!("{byte:02x}")).collect(),
+            })),
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            Command::ListSyncPolicyCandidates(after,limit) => crate::sync_policy::list_candidates(ds,tx,after.as_deref(),limit).map(Response::SyncPolicyCandidates),
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            Command::PreviewSyncPolicyCandidate(id) => crate::sync_policy::preview_candidate(ds,tx,&id).map(Response::SyncPolicyPreview),
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            Command::PreviewSyncRecoveryPolicy(state,vault,epoch,snapshot,reset_privacy) => crate::sync_policy::recovery_summary(ds,tx,&state,vault,epoch,snapshot,reset_privacy).map(Response::SyncRecoveryPolicySummary),
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            Command::ChooseSyncPolicy(request,gate) => {
+                let effects=crate::sync_policy::choose(ds,tx,request,gate,self.capture_policy.as_ref())?;
+                self.pending_capture_policy=effects.capture;
+                self.pending_privacy_engine=effects.privacy;
+                self.commit=true;Ok(Response::SyncPolicyChoice(effects.response))
+            },
+            Command::Report(operation) => Ok(Response::ReportLibrary(operation.read(tx))),
             Command::EnableCapturePolicy() => {
                 let mut policy = match ds.get_key_value(tx, CAPTURE_KEY) {
                     Ok(value) => serde_json::from_str::<CapturePolicy>(&value)
@@ -1052,16 +1283,10 @@ impl DatastoreWorker {
                 policy.effective_from = Utc::now();
                 policy.revision = policy.revision.checked_add(1)
                     .ok_or_else(|| DatastoreError::InternalError("Capture policy revision exhausted".into()))?;
-                match ds.get_key_value(tx, "settings.privacy_filters") {
-                    Ok(value) => self.privacy_engine = PrivacyFilterEngine::from_json(&value)
-                        .map_err(|_| DatastoreError::InternalError("Invalid saved privacy filters".into()))?,
-                    Err(DatastoreError::NoSuchKey(_)) => {},
-                    Err(error) => return Err(error),
-                }
+                let engine = Self::stored_privacy_engine(ds,tx)?;
                 ds.insert_key_value(tx, CAPTURE_KEY, &serde_json::to_string(&policy).unwrap())?;
-                self.capture_policy = Some(policy.clone());
-                self.last_heartbeat.clear();
-                self.capture_breaks.clear();
+                self.pending_privacy_engine = Some(engine);
+                self.pending_capture_policy = Some(policy.clone());
                 self.commit = true;
                 Ok(Response::CapturePolicy(policy))
             }
@@ -1078,15 +1303,15 @@ impl DatastoreWorker {
                     }
                 }
                 let backup_key = format!("peakactivity.privacy_backup.{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
-                ds.insert_key_value(tx, &backup_key, &serde_json::to_string(&saved).unwrap())?;
                 let mut policy = CapturePolicy::default();
                 policy.revision = self.capture_policy.as_ref().map_or(1, |p| p.revision.saturating_add(1));
-                ds.insert_key_value(tx, CAPTURE_KEY, &serde_json::to_string(&policy).unwrap())?;
-                ds.insert_key_value(tx, "settings.privacy_filters", "[]")?;
-                self.capture_policy = Some(policy.clone());
-                self.privacy_engine = PrivacyFilterEngine::new(vec![]);
-                self.last_heartbeat.clear();
-                self.capture_breaks.clear();
+                crate::datastore::with_savepoint(tx,"privacy_reset",|| {
+                    ds.insert_key_value(tx, &backup_key, &serde_json::to_string(&saved).unwrap())?;
+                    ds.insert_key_value(tx, CAPTURE_KEY, &serde_json::to_string(&policy).unwrap())?;
+                    ds.insert_key_value(tx, PRIVACY_FILTERS_KEY, "[]")
+                })?;
+                self.pending_capture_policy = Some(policy.clone());
+                self.pending_privacy_engine = Some(PrivacyFilterEngine::new(vec![]));
                 self.commit = true;
                 Ok(Response::CapturePolicy(policy))
             }
@@ -1178,9 +1403,25 @@ impl DatastoreWorker {
                 self.last_heartbeat.insert(bucketname, None);
                 Ok(Response::EventList(result))
             }
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            Command::ReconcileManualEntries(entries) => {
+                let input = crate::manual::validate_snapshot(&entries)?;
+                let filtered = input.iter().cloned().map(|event| {
+                    self.filter_event(crate::MANUAL_COMPANION_BUCKET,event.clone(),false)
+                        .filter(|filtered| filtered == &event)
+                }).collect();
+                let result = ds.reconcile_manual_projection(tx,input,filtered)?;
+                if result.inserted + result.corrected + result.deleted > 0 {
+                    self.last_heartbeat.remove(crate::MANUAL_COMPANION_BUCKET);
+                    self.capture_breaks.insert(crate::MANUAL_COMPANION_BUCKET.into());
+                    self.uncommitted_events += result.inserted + result.corrected + result.deleted;
+                    self.commit = true;
+                }
+                Ok(Response::ManualProjection(result))
+            }
             Command::PreviewImportEvents(bucketname, events) => Ok(Response::EventList(events.into_iter()
                 .filter_map(|event| self.filter_event(&bucketname, event, false)).collect())),
-                Command::ImportBuckets(source, commit) => self.import_buckets(ds, tx, source, commit, true)
+                Command::ImportBuckets(source, commit) => self.import_buckets(ds, tx, source, commit, true, false)
                     .map(Response::ImportSummary),
                 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
                 Command::RestoreSyncSnapshotData(source) => {
@@ -1191,10 +1432,14 @@ impl DatastoreWorker {
                             "Encrypted sync snapshots can be restored only into a clean vault".into(),
                         ));
                     }
-                    self.import_buckets(ds, tx, source, true, false).map(Response::ImportSummary)
+                    self.import_buckets(ds, tx, source, true, false, false).map(Response::ImportSummary)
                 }
                 #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
-                Command::RestoreSyncRecoveryData(source, material, snapshot, state, identity) => {
+                Command::RestoreSyncRecoveryData(source, material, snapshot, state, identity, expected_target,expected_context) => {
+                    crate::validate_sync_recovery_state_v1(&state,&source,material.key_epoch())?;
+                    if expected_context.as_ref().is_some_and(|expected|expected!=&ds.policy_context.iter().map(|b|format!("{b:02x}")).collect::<String>()) {
+                        return Err(DatastoreError::InternalError("Recovery target context changed".into()));
+                    }
                     let has_sync_keys = ds.get_sync_key_material(tx)?.is_some();
                     let has_sync_snapshot = ds.get_sync_snapshot(tx)?.is_some();
                     if has_sync_keys || has_sync_snapshot || !ds.get_buckets().is_empty()
@@ -1204,19 +1449,21 @@ impl DatastoreWorker {
                             "Encrypted sync snapshots require a clean vault with recording paused".into(),
                         ));
                     }
+                    let policy = crate::sync_policy::recovery_summary(ds,tx,&state,*material.vault_id(),material.key_epoch(),snapshot.snapshot_id,false)?;
+                    if expected_target.is_some_and(|expected|expected!=policy.target_binding_sha256) { return Err(DatastoreError::InvalidImport("The local settings changed after the recovery preview".into())); }
                     let old_commit = self.commit;
                     let old_uncommitted_events = self.uncommitted_events;
                     tx.execute_batch("SAVEPOINT peakactivity_sync_recovery")
                         .map_err(|_| DatastoreError::InternalError("Could not begin atomic sync recovery".into()))?;
                     let result = (|| {
-                        let summary = self.import_buckets(ds, tx, source, true, false)?;
+                        let summary = self.import_buckets(ds, tx, source, true, false, true)?;
                         ds.install_sync_recovery_data(tx, &material, &snapshot, &state, &identity)?;
                         tx.execute_batch("RELEASE SAVEPOINT peakactivity_sync_recovery")
                             .map_err(|_| DatastoreError::InternalError("Could not finish atomic sync recovery".into()))?;
                         Ok::<_, DatastoreError>(summary)
                     })();
                     match result {
-                        Ok(summary) => Ok(Response::ImportSummary(summary)),
+                        Ok(summary) => { self.commit=true; Ok(Response::ImportSummary(summary)) },
                         Err(error) => {
                             self.commit = old_commit;
                             self.uncommitted_events = old_uncommitted_events;
@@ -1738,8 +1985,14 @@ impl DatastoreWorker {
                 self.commit = true;
                 Ok(Response::AIInsightHistoryUpdate(Some(history)))
             }
+            #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+            Command::SetKeyValue(key,_) | Command::DeleteKeyValue(key) | Command::CompareAndSetKeyValue(key,_,_) | Command::GetKeyValue(key) if key.starts_with(crate::sync_policy::DECISION_PREFIX) =>
+                Err(DatastoreError::InternalError("Use the typed policy review controls".into())),
             Command::SetKeyValue(key, _) | Command::DeleteKeyValue(key) if key == CAPTURE_KEY =>
                 Err(DatastoreError::InternalError("Use the capture controls to change this policy".into())),
+            Command::SetKeyValue(key, _) | Command::DeleteKeyValue(key) | Command::CompareAndSetKeyValue(key, _, _)
+                if key == crate::reports::REPORT_LIBRARY_KEY =>
+                Err(DatastoreError::InternalError("Use the typed report library controls".into())),
             Command::SetKeyValue(key, _) | Command::DeleteKeyValue(key) if key == AI_SETTINGS_KEY || key == AI_HISTORY_KEY =>
                 Err(DatastoreError::InternalError("Use the typed AI settings API to change AI settings".into())),
             Command::SetKeyValue(key, _) | Command::DeleteKeyValue(key) if key.starts_with(EGRESS_KEY_PREFIX) =>
@@ -1750,9 +2003,11 @@ impl DatastoreWorker {
                 Err(DatastoreError::InternalError("Use the typed AI settings API to change AI settings".into())),
             Command::CompareAndSetKeyValue(key, _, _) if key.starts_with(EGRESS_KEY_PREFIX) =>
                 Err(DatastoreError::InternalError("Use the Privacy Firewall controls to change this policy".into())),
-            Command::SetKeyValue(key, data) => match ds.insert_key_value(tx, &key, &data) {
-                Ok(()) => Ok(Response::Empty()),
-                Err(e) => Err(e),
+            Command::SetKeyValue(key, data) => {
+                let engine = if key == PRIVACY_FILTERS_KEY { Some(Self::parsed_privacy_engine(&data)?) } else { None };
+                ds.insert_key_value(tx,&key,&data)?;
+                if let Some(engine) = engine { self.pending_privacy_engine = Some(engine); }
+                Ok(Response::Empty())
             },
             Command::CompareAndSetKeyValue(key, expected, data) => {
                 let current = match ds.get_key_value(tx, &key) {
@@ -1763,10 +2018,14 @@ impl DatastoreWorker {
                 if current != expected {
                     return Ok(Response::Boolean(false));
                 }
+                let engine = if key == PRIVACY_FILTERS_KEY {
+                    Some(match &data { Some(value) => Self::parsed_privacy_engine(value)?, None => PrivacyFilterEngine::new(vec![]) })
+                } else { None };
                 match data {
                     Some(data) => ds.insert_key_value(tx, &key, &data)?,
                     None => ds.delete_key_value(tx, &key)?,
                 }
+                if let Some(engine) = engine { self.pending_privacy_engine = Some(engine); }
                 self.commit = true;
                 Ok(Response::Boolean(true))
             }
@@ -1778,22 +2037,13 @@ impl DatastoreWorker {
                 Ok(result) => Ok(Response::KeyValue(result)),
                 Err(e) => Err(e),
             },
-            Command::DeleteKeyValue(key) => match ds.delete_key_value(tx, &key) {
-                Ok(()) => Ok(Response::Empty()),
-                Err(e) => Err(e),
+            Command::DeleteKeyValue(key) => {
+                ds.delete_key_value(tx,&key)?;
+                if key == PRIVACY_FILTERS_KEY { self.pending_privacy_engine = Some(PrivacyFilterEngine::new(vec![])); }
+                Ok(Response::Empty())
             },
             Command::RefreshPrivacyFilter() => {
-                // Reload privacy filter rules from settings
-                match ds.get_key_value(tx, "settings.privacy_filters") {
-                    Ok(json_str) => match PrivacyFilterEngine::from_json(&json_str) {
-                        Ok(engine) => self.privacy_engine = engine,
-                        Err(e) => warn!("Failed to parse privacy_filters setting: {e}"),
-                    },
-                    Err(_) => {
-                        // Settings key absent — clear rules so removing the key disables filtering
-                        self.privacy_engine = PrivacyFilterEngine::new(vec![]);
-                    }
-                }
+                self.pending_privacy_engine = Some(Self::stored_privacy_engine(ds,tx)?);
                 Ok(Response::Empty())
             }
             Command::RenameBucket(old_id, new_id) => match ds.rename_bucket(tx, &old_id, &new_id) {
@@ -1832,6 +2082,44 @@ impl DatastoreWorker {
 }
 
 impl Datastore {
+
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn export_sync_backup_continuity(&self,context:String)->Result<crate::SyncBackupContinuityV1,DatastoreError>{match self.request(Command::ExportSyncBackupContinuity(context))?{Response::SyncBackupContinuity(state)=>Ok(state),_=>Err(DatastoreError::InternalError("Unexpected backup continuity export".into()))}}
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn merge_sync_backup_continuity(&self,context:String,state:crate::SyncBackupContinuityV1,at:String)->Result<(),DatastoreError>{match self.request(Command::MergeSyncBackupContinuity(context,state,at))?{Response::Empty()=>Ok(()),_=>Err(DatastoreError::InternalError("Unexpected backup continuity merge".into()))}}
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn record_sync_backup_provider_intent(&self,context:String,proof:aw_sync_e2ee::SnapshotDeletionProofV1,key:&aw_sync_e2ee::VaultDataKeyV1,record:aw_sync_e2ee::EncryptedSyncSnapshotV1,at:String)->Result<(),DatastoreError>{
+        if !proof.matches_record(key,&record){return Err(DatastoreError::InternalError("Backup retry record differs from proof".into()));}
+        match self.request(Command::RecordSyncBackupProviderIntent(context,proof,record,at))?{Response::Empty()=>Ok(()),_=>Err(DatastoreError::InternalError("Unexpected backup retry write".into()))}
+    }
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn ensure_sync_backup_not_deleted(&self,context:String,vault:String,epoch:u64,snapshot:String,objects:Vec<String>)->Result<(),DatastoreError>{match self.request(Command::EnsureSyncBackupNotDeleted(context,vault,epoch,snapshot,objects))?{Response::Empty()=>Ok(()),_=>Err(DatastoreError::InternalError("Unexpected backup deletion admission".into()))}}
+
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn list_sync_backup_deletions(&self,context:String,cursor:Option<crate::SyncBackupDeletionCursorV1>,limit:usize)->Result<crate::SyncBackupDeletionPageV1,DatastoreError>{match self.request(Command::ListSyncBackupDeletions(context,cursor,limit))?{Response::SyncBackupDeletionPage(page)=>Ok(page),_=>Err(DatastoreError::InternalError("Unexpected backup deletion page".into()))}}
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn export_sync_backup_deletions(&self,context:String)->Result<Vec<aw_models::SnapshotDeletionFactV1>,DatastoreError>{match self.request(Command::ExportSyncBackupDeletions(context))?{Response::SyncBackupDeletions(facts)=>Ok(facts),_=>Err(DatastoreError::InternalError("Unexpected backup deletion export".into()))}}
+
+    /// Merge only facts admitted by authenticated recovery or signed manifests; physical copies are retained.
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn merge_sync_backup_deletions(&self,context:String,facts:Vec<aw_models::SnapshotDeletionFactV1>,at:String)->Result<usize,DatastoreError>{match self.request(Command::MergeSyncBackupDeletions(context,facts,at))?{Response::SyncCounter(n)=>usize::try_from(n).map_err(|_|DatastoreError::InternalError("Backup deletion fact count is invalid".into())),_=>Err(DatastoreError::InternalError("Unexpected backup deletion fact merge".into()))}}
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn record_sync_backup_deletion_intent(&self,context:String,proof:aw_sync_e2ee::SnapshotDeletionProofV1,at:String)->Result<usize,DatastoreError>{match self.request(Command::RecordSyncBackupDeletionIntent(context,proof,at))?{Response::SyncCounter(count)=>usize::try_from(count).map_err(|_|DatastoreError::InternalError("Backup deletion intent count is invalid".into())),_=>Err(DatastoreError::InternalError("Unexpected backup deletion intent response".into()))}}
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn delete_sync_backup(&self,context:String,proof:aw_sync_e2ee::SnapshotDeletionProofV1,at:String)->Result<usize,DatastoreError>{
+        match self.request(Command::DeleteSyncBackup(context,proof,at))?{Response::SyncCounter(count)=>usize::try_from(count).map_err(|_|DatastoreError::InternalError("Backup deletion count is invalid".into())),_=>Err(DatastoreError::InternalError("Unexpected backup deletion response".into()))}
+    }
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn get_sync_backup_deletion(&self,id:String)->Result<Option<aw_models::SnapshotDeletionFactV1>,DatastoreError>{
+        match self.request(Command::GetSyncBackupDeletion(id))?{Response::SyncBackupDeletion(fact)=>Ok(fact),_=>Err(DatastoreError::InternalError("Unexpected backup deletion metadata".into()))}
+    }
+    #[cfg(any(feature="encryption",feature="encryption-vendored"))]
+    pub fn stage_sync_backup_objects(&self,context:String,objects:Vec<aw_models::SyncEnvelopeV1>,at:String)->Result<usize,DatastoreError> {
+        match self.request(Command::StageSyncBackupObjects(context,objects,at))? {
+            Response::SyncCounter(count)=>usize::try_from(count).map_err(|_|DatastoreError::InternalError("Backup stage count is invalid".into())),
+            _=>Err(DatastoreError::InternalError("Unexpected backup stage response".into())),
+        }
+    }
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
     pub fn load_sync_device_identity(&self) -> Result<Option<SyncDeviceIdentity>, DatastoreError> {
         match self.request(Command::GetSyncDeviceIdentity())? {
@@ -2135,6 +2423,25 @@ impl Datastore {
     }
 
     #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn get_sync_policy_context(&self)->Result<aw_models::SyncPolicyContextV1,DatastoreError>{
+        match self.request(Command::GetSyncPolicyContext)? {Response::SyncPolicyContext(context)=>Ok(context),_=>Err(DatastoreError::InternalError("Policy context is unavailable".into()))}
+    }
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn list_sync_policy_candidates(&self,after:Option<&str>,limit:usize)->Result<aw_models::SyncPolicyCandidatePageV1,DatastoreError>{
+        match self.request(Command::ListSyncPolicyCandidates(after.map(str::to_owned),limit))? {Response::SyncPolicyCandidates(page)=>Ok(page),_=>Err(DatastoreError::InternalError("Policy review is unavailable".into()))}
+    }
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn preview_sync_policy_candidate(&self,id:&str)->Result<aw_models::SyncPolicyPreviewV1,DatastoreError>{
+        match self.request(Command::PreviewSyncPolicyCandidate(id.to_owned()))? {Response::SyncPolicyPreview(preview)=>Ok(preview),_=>Err(DatastoreError::InternalError("Policy review is unavailable".into()))}
+    }
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn choose_sync_policy(&self,request:aw_models::SyncPolicyChoiceRequestV1)->Result<aw_models::SyncPolicyChoiceResultV1,DatastoreError>{self.choose_sync_policy_with_activation(request,None)}
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn choose_sync_policy_with_activation(&self,request:aw_models::SyncPolicyChoiceRequestV1,gate:Option<crate::SyncPolicyActivationGateV1>)->Result<aw_models::SyncPolicyChoiceResultV1,DatastoreError>{
+        match self.request(Command::ChooseSyncPolicy(request,gate))? {Response::SyncPolicyChoice(result)=>Ok(result),_=>Err(DatastoreError::InternalError("Policy review is unavailable".into()))}
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
     pub fn next_sync_operation_counter(
         &self,
         device_id: [u8; 16],
@@ -2236,6 +2543,20 @@ impl Datastore {
         }
     }
 
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    /// Reconcile an accepted, committed local companion snapshot atomically.
+    /// Missing owned UUIDs are explicit deletions; privacy-filtered present UUIDs
+    /// are preserved. An unchanged source digest leaves peer corrections intact.
+    /// The native caller owns sharing consent; this method never sends data.
+    pub fn reconcile_manual_entries(&self, entries: &[crate::ManualActivityEntryV1]) -> Result<crate::ManualProjectionResultV1, DatastoreError> {
+        if self.is_locked() { return Err(DatastoreError::Locked); }
+        if !self.is_encrypted() { return Err(DatastoreError::InvalidImport("Manual companion projection requires SQLCipher".into())); }
+        match self.request(Command::ReconcileManualEntries(entries.to_vec()))? {
+            Response::ManualProjection(result) => Ok(result),
+            _ => Err(DatastoreError::InternalError("Unexpected manual projection response".into())),
+        }
+    }
+
     pub fn preview_import_events(&self, bucket: &str, events: &[Event]) -> Result<Vec<Event>, DatastoreError> {
         match self.request(Command::PreviewImportEvents(bucket.into(), events.to_vec()))? {
             Response::EventList(events) => Ok(events),
@@ -2274,10 +2595,25 @@ impl Datastore {
         state: SyncRecoveryStateV1,
         identity: SyncDeviceIdentity,
     ) -> Result<ImportSummary, DatastoreError> {
-        match self.request(Command::RestoreSyncRecoveryData(source, material, snapshot, state, identity))? {
+        self.restore_sync_recovery_data_with_policy_target(source,material,snapshot,state,identity,None)
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn restore_sync_recovery_data_with_policy_target(&self,source:BucketsExport,material:SyncKeyMaterial,snapshot:SyncSnapshotV1,state:SyncRecoveryStateV1,identity:SyncDeviceIdentity,expected_target:Option<String>)->Result<ImportSummary,DatastoreError>{
+        self.restore_sync_recovery_data_with_context(source,material,snapshot,state,identity,expected_target,None)
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn restore_sync_recovery_data_with_context(&self,source:BucketsExport,material:SyncKeyMaterial,snapshot:SyncSnapshotV1,state:SyncRecoveryStateV1,identity:SyncDeviceIdentity,expected_target:Option<String>,expected_context:Option<String>)->Result<ImportSummary,DatastoreError>{
+        match self.request(Command::RestoreSyncRecoveryData(source, material, snapshot, state, identity, expected_target,expected_context))? {
             Response::ImportSummary(summary) => Ok(summary),
             _ => Err(DatastoreError::InternalError("Unexpected sync recovery response".into())),
         }
+    }
+
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    pub fn preview_sync_recovery_policy(&self,state:SyncRecoveryStateV1,vault:[u8;16],epoch:u64,snapshot:[u8;16],reset_privacy:bool)->Result<aw_models::SyncRecoveryPolicySummaryV1,DatastoreError>{
+        match self.request(Command::PreviewSyncRecoveryPolicy(state,vault,epoch,snapshot,reset_privacy))? {Response::SyncRecoveryPolicySummary(summary)=>Ok(summary),_=>Err(DatastoreError::InternalError("Recovery policy summary is unavailable".into()))}
     }
 
     /// Open a SQLCipher vault without silently creating plaintext or replacing a
@@ -2344,11 +2680,13 @@ impl Datastore {
         Datastore {
             worker: Arc::new(RwLock::new(Some(Worker { requester, thread }))),
             encrypted: Arc::new(AtomicBool::new(encrypted)),
+            report_invalidator: Arc::new(RwLock::new(None)),
+            report_runtime: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn new_locked() -> Self {
-        Self { worker: Arc::new(RwLock::new(None)), encrypted: Arc::new(AtomicBool::new(false)) }
+        Self { worker: Arc::new(RwLock::new(None)), encrypted: Arc::new(AtomicBool::new(false)), report_invalidator: Arc::new(RwLock::new(None)), report_runtime: Arc::new(Mutex::new(None)) }
     }
 
     pub fn is_locked(&self) -> bool {
@@ -2371,7 +2709,22 @@ impl Datastore {
     }
 
     /// Wait for in-flight calls, flush the worker and release its connection/key.
+    pub fn share_report_runtime<T:std::any::Any+Send+Sync>(&self,create:impl FnOnce()->Arc<T>)->Arc<T> {
+        let mut slot=self.report_runtime.lock().unwrap_or_else(|p|p.into_inner());
+        if let Some(existing)=slot.as_ref().and_then(Weak::upgrade).and_then(|runtime|runtime.downcast::<T>().ok()) {return existing;}
+        let runtime=create();
+        // Weak storage avoids an ownership cycle between the coordinator and datastore.
+        let erased:Arc<dyn std::any::Any+Send+Sync>=runtime.clone();*slot=Some(Arc::downgrade(&erased));runtime
+    }
+    pub fn set_report_invalidator(&self,hook:Arc<dyn Fn()+Send+Sync>) {
+        let mut slot=self.report_invalidator.write().unwrap_or_else(|p|p.into_inner());*slot=Some(hook);
+    }
+    pub fn invalidate_report_runtime(&self) {
+        let hook=self.report_invalidator.read().unwrap_or_else(|p|p.into_inner()).clone();
+        if let Some(hook)=hook {hook();}
+    }
     pub fn lock(&self) -> Result<(), DatastoreError> {
+        self.invalidate_report_runtime();
         let mut slot = self.worker.write().map_err(|_| DatastoreError::Locked)?;
         if let Some(worker) = slot.take() {
             let result = worker.requester.request(Command::Close()).map_err(|_| DatastoreError::Locked)
@@ -2807,6 +3160,46 @@ impl Datastore {
         match self.request(cmd)? {
             Response::KeyValue(kv) => Ok(kv),
             _ => panic!("Invalid response"),
+        }
+    }
+
+    pub fn report_library(&self) -> Result<aw_models::ReportLibraryV1, aw_models::ReportExecutionErrorV1> {
+        match self.report_request(crate::reports::ReportOperationV1::Library)? {
+            crate::reports::ReportResponseV1::Library(value)=>Ok(value), _=>Err(aw_models::ReportExecutionErrorV1::InternalError)
+        }
+    }
+    pub fn update_report_library(&self, request: aw_models::UpdateReportLibraryRequestV1,
+        access: Arc<dyn aw_models::ReportFeatureAccessV1>) -> Result<aw_models::ReportLibraryV1, aw_models::ReportExecutionErrorV1> {
+        match self.report_request(crate::reports::ReportOperationV1::Update(request, access))? {
+            crate::reports::ReportResponseV1::Library(value)=>Ok(value), _=>Err(aw_models::ReportExecutionErrorV1::InternalError)
+        }
+    }
+    pub fn prepare_report_import(&self, package: aw_models::PortableReportPackV1, access: Arc<dyn aw_models::ReportFeatureAccessV1>) -> Result<Arc<crate::PreparedReportImportV1>, aw_models::ReportExecutionErrorV1> {
+        match self.report_request(crate::reports::ReportOperationV1::Prepare(package,access))? {
+            crate::reports::ReportResponseV1::Prepared(value)=>Ok(value), _=>Err(aw_models::ReportExecutionErrorV1::InternalError)
+        }
+    }
+    pub fn commit_report_import(&self, prepared: Arc<crate::PreparedReportImportV1>, access: Arc<dyn aw_models::ReportFeatureAccessV1>) -> Result<aw_models::ReportLibraryV1, aw_models::ReportExecutionErrorV1> {
+        match self.report_request(crate::reports::ReportOperationV1::Commit(prepared,access))? {
+            crate::reports::ReportResponseV1::Library(value)=>Ok(value), _=>Err(aw_models::ReportExecutionErrorV1::InternalError)
+        }
+    }
+    pub fn export_report_library(&self, include_category_sets: bool) -> Result<aw_models::ReportPortableExportV1, aw_models::ReportExecutionErrorV1> {
+        match self.report_request(crate::reports::ReportOperationV1::Export(include_category_sets))? {
+            crate::reports::ReportResponseV1::Export(value)=>Ok(value), _=>Err(aw_models::ReportExecutionErrorV1::InternalError)
+        }
+    }
+    pub fn read_report_inputs(&self,request:aw_models::AdvancedReportRunRequestV1,control:Arc<aw_models::QueryControl>,access:Arc<dyn aw_models::ReportFeatureAccessV1>)->Result<Arc<aw_models::ReportInputSnapshotV1>,aw_models::ReportExecutionErrorV1> {
+        match self.report_request(crate::reports::ReportOperationV1::Inputs(request,control,access))? {
+            crate::reports::ReportResponseV1::Inputs(value)=>Ok(value),_=>Err(aw_models::ReportExecutionErrorV1::InternalError)
+        }
+    }
+    fn report_request(&self, operation: crate::reports::ReportOperationV1) -> Result<crate::reports::ReportResponseV1, aw_models::ReportExecutionErrorV1> {
+        if !self.is_encrypted() {return Err(aw_models::ReportExecutionErrorV1::SourceUnavailable);}
+        match self.request(Command::Report(operation)) {
+            Ok(Response::ReportLibrary(result)) => result,
+            Err(DatastoreError::Locked) => Err(aw_models::ReportExecutionErrorV1::SourceUnavailable),
+            Err(_) | Ok(_) => Err(aw_models::ReportExecutionErrorV1::InternalError),
         }
     }
 

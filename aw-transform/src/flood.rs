@@ -1,7 +1,5 @@
 use aw_models::Event;
 
-use crate::sort_by_timestamp;
-
 /// Floods event to the nearest neighbouring event if within the specified pulsetime.
 ///
 /// Also merges events if they have the same data and are within the pulsetime.
@@ -34,8 +32,17 @@ use crate::sort_by_timestamp;
 /// output: [a    ] [b    ]
 /// ```
 pub fn flood(events: Vec<Event>, pulsetime: chrono::Duration) -> Vec<Event> {
+    flood_controlled(events, pulsetime, &aw_models::QueryControl::unlimited())
+        .expect("unlimited flood")
+}
+pub fn flood_controlled(
+    events: Vec<Event>,
+    pulsetime: chrono::Duration,
+    control: &aw_models::QueryControl,
+) -> Result<Vec<Event>, aw_models::ReportExecutionErrorV1> {
+    control.checkpoint()?;
     let mut new_events = Vec::new();
-    let mut events_sorted = sort_by_timestamp(events);
+    let mut events_sorted = crate::sort_by_timestamp_controlled(events, control)?;
     let mut e1_iter = events_sorted.drain(..).peekable();
 
     let mut gap_prev: Option<chrono::Duration> = None;
@@ -54,6 +61,7 @@ pub fn flood(events: Vec<Event>, pulsetime: chrono::Duration) -> Vec<Event> {
         }
         None => e1_iter.next(),
     } {
+        control.charge_fuel(1)?;
         if let Some(gap) = gap_prev {
             e1.timestamp -= gap / 2;
             e1.duration += gap / 2;
@@ -62,6 +70,7 @@ pub fn flood(events: Vec<Event>, pulsetime: chrono::Duration) -> Vec<Event> {
         let e2 = match e1_iter.peek() {
             Some(e) => e,
             None => {
+                crate::report_merged_slot(new_events.len(), control)?;
                 new_events.push(e1);
                 break;
             }
@@ -70,7 +79,7 @@ pub fn flood(events: Vec<Event>, pulsetime: chrono::Duration) -> Vec<Event> {
         // Ensure that ordering is preserved, at least in tests
         debug_assert!(e1.timestamp <= e2.timestamp);
 
-        let gap = e2.timestamp - e1.calculate_endtime();
+        let gap = e2.timestamp - crate::report_event_end(&e1, control)?;
 
         // We split the program flow into 2 parts: positive and negative gaps
         // First we check negative gaps (if events overlap)
@@ -98,7 +107,10 @@ pub fn flood(events: Vec<Event>, pulsetime: chrono::Duration) -> Vec<Event> {
                     warned_negative_gap_safe = true;
                 }
                 let start = std::cmp::min(e1.timestamp, e2.timestamp);
-                let end = std::cmp::max(e1.calculate_endtime(), e2.calculate_endtime()); // e2 isn't guaranteed to end last
+                let end = std::cmp::max(
+                    crate::report_event_end(&e1, control)?,
+                    crate::report_event_end(e2, control)?,
+                ); // e2 isn't guaranteed to end last
                 e1.timestamp = start;
                 e1.duration = end - start;
                 // Drop next event since it is merged/flooded into e1
@@ -135,7 +147,10 @@ pub fn flood(events: Vec<Event>, pulsetime: chrono::Duration) -> Vec<Event> {
             if e1.data == e2.data {
                 // Choose the longest event and set the endtime to it
                 let start = std::cmp::min(e1.timestamp, e2.timestamp); // isn't e1 guaranteed to start?
-                let end = std::cmp::max(e1.calculate_endtime(), e2.calculate_endtime()); // e2 isn't guaranteed to end last
+                let end = std::cmp::max(
+                    crate::report_event_end(&e1, control)?,
+                    crate::report_event_end(e2, control)?,
+                ); // e2 isn't guaranteed to end last
                 e1.timestamp = start;
                 e1.duration = end - start;
                 // Drop next event since it is merged/flooded into e1
@@ -156,9 +171,11 @@ pub fn flood(events: Vec<Event>, pulsetime: chrono::Duration) -> Vec<Event> {
         }
         // else: nothing to do, events not near each other
 
+        crate::report_merged_slot(new_events.len(), control)?;
         new_events.push(e1);
     }
-    new_events
+    control.checkpoint()?;
+    Ok(new_events)
 }
 
 #[cfg(test)]

@@ -61,6 +61,143 @@ mod datastore_tests {
     }
 
     #[test]
+    fn pre_epoch_events_preserve_fractional_precision_unbounded_ranges_and_worker_health() {
+        let ds = Datastore::new_in_memory(false);
+        let bucket = create_test_bucket(&ds);
+        let events = [
+            Event::new(
+                "1969-12-31T23:59:58.5Z".parse().unwrap(),
+                Duration::seconds(1),
+                json_map! {"app": "synthetic"},
+            ),
+            Event::new(
+                "1969-12-31T23:59:59.999999999Z".parse().unwrap(),
+                Duration::nanoseconds(1),
+                json_map! {"app": "synthetic"},
+            ),
+        ];
+        let ids = ds.insert_events(&bucket.id, &events).unwrap();
+        for (id, expected) in ids.iter().zip(events.iter()) {
+            let actual = ds.get_event(&bucket.id, id.id.unwrap()).unwrap();
+            assert_eq!(actual.timestamp, expected.timestamp);
+            assert_eq!(actual.duration, expected.duration);
+        }
+        let all = ds.get_events(&bucket.id, None, None, None).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].timestamp, events[1].timestamp);
+        assert_eq!(all[1].timestamp, events[0].timestamp);
+        assert_eq!(all[1].duration, events[0].duration);
+        assert_eq!(ds.get_event_count(&bucket.id, None, None).unwrap(), 2);
+        assert!(ds
+            .get_events(&bucket.id, None, None, Some(0))
+            .unwrap()
+            .is_empty());
+        let limited = ds.get_events(&bucket.id, None, None, Some(1)).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].timestamp, events[1].timestamp);
+        let unbounded = ds
+            .get_events_unclipped(&bucket.id, None, None, None)
+            .unwrap();
+        assert_eq!(unbounded.len(), 2);
+        assert_eq!(unbounded[1].timestamp, events[0].timestamp);
+        assert_eq!(unbounded[1].duration, events[0].duration);
+        let start = "1969-12-31T23:59:58.75Z".parse().unwrap();
+        let end = "1969-12-31T23:59:59.25Z".parse().unwrap();
+        let clipped = ds
+            .get_events(&bucket.id, Some(start), Some(end), None)
+            .unwrap();
+        assert_eq!(clipped.len(), 1);
+        assert_eq!(clipped[0].timestamp, start);
+        assert_eq!(clipped[0].duration, Duration::milliseconds(500));
+        let original = ds
+            .get_events_unclipped(&bucket.id, Some(start), Some(end), None)
+            .unwrap();
+        assert_eq!(original[0].timestamp, events[0].timestamp);
+        assert_eq!(original[0].duration, events[0].duration);
+        ds.set_key_value("pre-epoch-worker-health", "still-usable")
+            .unwrap();
+        assert_eq!(
+            ds.get_key_value("pre-epoch-worker-health").unwrap(),
+            "still-usable"
+        );
+        ds.lock().unwrap();
+    }
+
+    #[test]
+    fn pre_epoch_out_of_storage_range_query_bounds_return_error_without_stopping_worker() {
+        let ds = Datastore::new_in_memory(false);
+        let bucket = create_test_bucket(&ds);
+        for value in ["1500-01-01T00:00:00Z", "2500-01-01T00:00:00Z"] {
+            let bound = value.parse().unwrap();
+            for (start, end) in [(Some(bound), None), (None, Some(bound))] {
+                assert!(matches!(
+                    ds.get_events(&bucket.id, start, end, None),
+                    Err(aw_datastore::DatastoreError::InvalidTimeRange)
+                ));
+                assert!(matches!(
+                    ds.get_events_unclipped(&bucket.id, start, end, None),
+                    Err(aw_datastore::DatastoreError::InvalidTimeRange)
+                ));
+                assert!(matches!(
+                    ds.get_event_count(&bucket.id, start, end),
+                    Err(aw_datastore::DatastoreError::InvalidTimeRange)
+                ));
+            }
+        }
+        assert!(ds.get_buckets().unwrap().contains_key(&bucket.id));
+        ds.lock().unwrap();
+    }
+
+    #[test]
+    #[cfg(any(feature = "encryption", feature = "encryption-vendored"))]
+    fn pre_epoch_encrypted_reopen_preserves_negative_fractional_bucket_metadata() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let root = std::env::temp_dir().join(format!(
+            "peak-pre-epoch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("vault.db").to_string_lossy().into_owned();
+        let key = "a".repeat(64);
+        let ds = Datastore::open_encrypted(path.clone(), key.clone()).unwrap();
+        let bucket = create_test_bucket(&ds);
+        let mut empty = test_bucket();
+        empty.id = "empty".into();
+        ds.create_bucket(&empty).unwrap();
+        let event = Event::new(
+            "1969-12-31T23:59:58.123456789Z".parse().unwrap(),
+            Duration::nanoseconds(750_000_001),
+            json_map! {"app": "synthetic"},
+        );
+        let inserted = ds
+            .insert_events(&bucket.id, std::slice::from_ref(&event))
+            .unwrap();
+        ds.lock().unwrap();
+
+        let reopened = Datastore::open_encrypted(path, key).unwrap();
+        let buckets = reopened.get_buckets().unwrap();
+        assert_eq!(buckets[&bucket.id].metadata.start, Some(event.timestamp));
+        assert_eq!(
+            buckets[&bucket.id].metadata.end,
+            Some(event.calculate_endtime())
+        );
+        assert_eq!(buckets[&empty.id].metadata.start, None);
+        assert_eq!(buckets[&empty.id].metadata.end, None);
+        let fetched = reopened
+            .get_event(&bucket.id, inserted[0].id.unwrap())
+            .unwrap();
+        assert_eq!(fetched.timestamp, event.timestamp);
+        assert_eq!(fetched.duration, event.duration);
+        assert_eq!(reopened.get_event_count(&bucket.id, None, None).unwrap(), 1);
+        reopened.lock().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn test_bucket_create_delete() {
         // Setup datastore
         let ds = Datastore::new_in_memory(false);
